@@ -1,0 +1,13 @@
+# Day-1 / local exploration (this machine: 4GB GPU, CPU-only torch is fine here)
+airfrans
+numpy
+matplotlib
+pyvista
+
+# Modeling stack (install on Colab for real training runs)
+torch
+torch_geometric
+lightning
+
+# Demo (week 6)
+gradio

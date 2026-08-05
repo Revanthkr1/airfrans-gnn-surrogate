@@ -1,0 +1,11 @@
+data/
+*.pt
+*.pth
+*.ckpt
+wandb/
+lightning_logs/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+*.egg-info/
