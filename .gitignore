@@ -1,4 +1,5 @@
-data/
+data/*
+!data/norm_stats.npz
 *.pt
 *.pth
 *.ckpt
