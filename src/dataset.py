@@ -5,6 +5,7 @@ from torch_geometric.data import Data, Dataset
 
 from src.data import load_case
 from src.graph import build_graph, build_subsampled_graph
+from src.preprocess import cache_path
 
 
 class AirfRANSGraphDataset:
@@ -72,3 +73,38 @@ class PyGAirfRANSDataset(Dataset):
 
     def get(self, idx):
         return to_pyg_data(self.inner[idx])
+
+
+class CachedPyGAirfRANSDataset(Dataset):
+    """Reads pre-built graph tensors from src.preprocess's cache -- no VTU parsing
+    at train time. Run src.preprocess.preprocess_split over `names` first."""
+
+    def __init__(self, cache_dir, names, stats=None):
+        super().__init__()
+        self.cache_dir = cache_dir
+        self.names = names
+        self.stats = stats
+
+    def len(self):
+        return len(self.names)
+
+    def get(self, idx):
+        name = self.names[idx]
+        item = torch.load(cache_path(self.cache_dir, name), weights_only=True)
+        x, targets = item["node_features"], item["targets"]
+
+        if self.stats is not None:
+            node_mean = torch.as_tensor(self.stats["node_mean"], dtype=torch.float32)
+            node_std = torch.as_tensor(self.stats["node_std"], dtype=torch.float32)
+            target_mean = torch.as_tensor(self.stats["target_mean"], dtype=torch.float32)
+            target_std = torch.as_tensor(self.stats["target_std"], dtype=torch.float32)
+            x = (x - node_mean) / node_std
+            targets = (targets - target_mean) / target_std
+
+        return Data(
+            x=x,
+            edge_index=item["edge_index"],
+            edge_attr=item["edge_attr"],
+            y=targets,
+            name=item["name"],
+        )
