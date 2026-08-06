@@ -27,15 +27,20 @@ def preprocess_case(dataset_root, name, cache_dir):
         return out_path
 
     simulation, _ = load_case(dataset_root, name)
-    node_features, edge_index, edge_attr = build_graph(simulation)
+    # edge_attr is dropped here -- it's fully determined by position + edge_index
+    # (dst - src), so CachedPyGAirfRANSDataset recomputes it instead of storing it.
+    # edge_index as int32 (not PyG's usual int64): node counts are ~180k, well
+    # under int32 range, and it's the single biggest piece of the cache -- these
+    # two changes take a case from ~24MB to ~12MB, which mattered once a Colab
+    # disk filled up caching the full 800-case split.
+    node_features, edge_index, _ = build_graph(simulation)
     targets = np.concatenate(
         [simulation.velocity, simulation.pressure, simulation.nu_t], axis=1
     )
     torch.save(
         {
             "node_features": torch.tensor(node_features, dtype=torch.float32),
-            "edge_index": torch.tensor(edge_index, dtype=torch.long),
-            "edge_attr": torch.tensor(edge_attr, dtype=torch.float32),
+            "edge_index": torch.tensor(edge_index, dtype=torch.int32),
             "targets": torch.tensor(targets, dtype=torch.float32),
             "surface": torch.tensor(simulation.surface),
             "name": name,
