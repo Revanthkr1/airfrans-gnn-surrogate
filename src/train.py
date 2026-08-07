@@ -58,11 +58,19 @@ def main(
     stats_path,
     checkpoint_path,
     max_epochs=100,
-    batch_size=4,
+    batch_size=1,
+    accumulate_grad_batches=4,
     n_val=80,
     lr=1e-3,
     model_kwargs=None,
 ):
+    """batch_size=1 by default: batching multiple full-resolution graphs (each
+    ~180k nodes/~720k edges) into one forward pass blew past a 16GB T4's memory
+    with batch_size=4 (~2.88M edges x 4 message-passing rounds retaining
+    activations for backprop). accumulate_grad_batches recovers a larger
+    effective batch size (gradient-averaged over that many steps) without
+    holding more than one graph in memory at a time.
+    """
     stats = dict(np.load(stats_path))
     all_train_names = split_names(dataset_root, task="full", train=True)
     # Official test split (200 cases) is NOT used here -- reserved for week 5.
@@ -79,7 +87,11 @@ def main(
         stats["target_mean"], stats["target_std"], lr=lr, **(model_kwargs or {})
     )
     trainer = L.Trainer(
-        max_epochs=max_epochs, accelerator="auto", log_every_n_steps=10, logger=False
+        max_epochs=max_epochs,
+        accelerator="auto",
+        log_every_n_steps=10,
+        logger=False,
+        accumulate_grad_batches=accumulate_grad_batches,
     )
     trainer.fit(module, train_loader, val_loader)
 
@@ -94,4 +106,6 @@ if __name__ == "__main__":
         cache_dir=os.path.join(DATA_ROOT, "cache", "full"),
         stats_path=os.path.join(DATA_ROOT, "norm_stats.npz"),
         checkpoint_path=os.path.join(DATA_ROOT, "meshgraphnet.ckpt"),
+        batch_size=1,
+        accumulate_grad_batches=4,
     )
