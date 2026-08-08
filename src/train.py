@@ -13,6 +13,7 @@ import os
 import lightning as L
 import numpy as np
 import torch
+from lightning.pytorch.callbacks import ModelCheckpoint
 from torch_geometric.loader import DataLoader
 
 from src.data import split_names
@@ -63,6 +64,7 @@ def main(
     n_val=80,
     lr=1e-3,
     model_kwargs=None,
+    checkpoint_every_n_epochs=5,
 ):
     """batch_size=1 by default: batching multiple full-resolution graphs (each
     ~180k nodes/~720k edges) into one forward pass blew past a 16GB T4's memory
@@ -70,6 +72,11 @@ def main(
     activations for backprop). accumulate_grad_batches recovers a larger
     effective batch size (gradient-averaged over that many steps) without
     holding more than one graph in memory at a time.
+
+    checkpoint_every_n_epochs: this Colab session has already dropped its GPU
+    and hit OOM once each -- a single end-of-training checkpoint would lose
+    everything to a disconnect. Periodic checkpoints land next to
+    checkpoint_path so progress survives a crash.
     """
     stats = dict(np.load(stats_path))
     all_train_names = split_names(dataset_root, task="full", train=True)
@@ -86,17 +93,26 @@ def main(
     module = TrainModule(
         stats["target_mean"], stats["target_std"], lr=lr, **(model_kwargs or {})
     )
+    checkpoint_dir = os.path.dirname(checkpoint_path)
+    periodic_ckpt = ModelCheckpoint(
+        dirpath=checkpoint_dir,
+        filename="mgn-{epoch:03d}",
+        every_n_epochs=checkpoint_every_n_epochs,
+        save_top_k=-1,  # keep all of them -- checkpoints are a few MB, not worth pruning
+    )
     trainer = L.Trainer(
         max_epochs=max_epochs,
         accelerator="auto",
         log_every_n_steps=10,
         logger=False,
         accumulate_grad_batches=accumulate_grad_batches,
+        callbacks=[periodic_ckpt],
     )
     trainer.fit(module, train_loader, val_loader)
 
     trainer.save_checkpoint(checkpoint_path)
-    print(f"Saved checkpoint to {checkpoint_path}")
+    print(f"Saved final checkpoint to {checkpoint_path}")
+    print(f"Periodic checkpoints (every {checkpoint_every_n_epochs} epochs) in {checkpoint_dir}")
 
 
 if __name__ == "__main__":
