@@ -1,5 +1,6 @@
 data/*
 !data/norm_stats.npz
+!data/manifest.json
 *.pt
 *.pth
 *.ckpt

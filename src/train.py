@@ -8,6 +8,7 @@ The official 200-case test split is deliberately NOT touched here -- it's held
 out for week 5's final evaluation (lift/drag surface integration). This module
 carves its own validation set out of the 800 training cases instead.
 """
+import glob
 import os
 
 import lightning as L
@@ -67,6 +68,7 @@ def main(
     checkpoint_every_n_epochs=5,
     num_workers=2,
     precision="32-true",
+    resume_from_checkpoint=None,
 ):
     """batch_size=1 by default: batching multiple full-resolution graphs (each
     ~180k nodes/~720k edges) into one forward pass blew past a 16GB T4's memory
@@ -79,6 +81,12 @@ def main(
     and hit OOM once each -- a single end-of-training checkpoint would lose
     everything to a disconnect. Periodic checkpoints land next to
     checkpoint_path so progress survives a crash.
+
+    resume_from_checkpoint: path to resume from. If None, auto-detects the
+    most recent periodic checkpoint in checkpoint_dir (by epoch number) and
+    resumes from that -- so just re-running after a disconnect picks up where
+    training left off instead of restarting at epoch 0. Pass an explicit path
+    to override, or a nonexistent dir if you genuinely want to start fresh.
     """
     stats = dict(np.load(stats_path))
     all_train_names = split_names(dataset_root, task="full", train=True)
@@ -105,6 +113,15 @@ def main(
         every_n_epochs=checkpoint_every_n_epochs,
         save_top_k=-1,  # keep all of them -- checkpoints are a few MB, not worth pruning
     )
+
+    if resume_from_checkpoint is None:
+        # filenames zero-pad the epoch number (mgn-epoch=003.ckpt), so lexicographic
+        # sort order matches numeric order -- last one is the most recent.
+        existing = sorted(glob.glob(os.path.join(checkpoint_dir, "mgn-epoch=*.ckpt")))
+        resume_from_checkpoint = existing[-1] if existing else None
+    if resume_from_checkpoint:
+        print(f"Resuming from {resume_from_checkpoint}")
+
     trainer = L.Trainer(
         max_epochs=max_epochs,
         accelerator="auto",
@@ -114,7 +131,7 @@ def main(
         accumulate_grad_batches=accumulate_grad_batches,
         callbacks=[periodic_ckpt],
     )
-    trainer.fit(module, train_loader, val_loader)
+    trainer.fit(module, train_loader, val_loader, ckpt_path=resume_from_checkpoint)
 
     trainer.save_checkpoint(checkpoint_path)
     print(f"Saved final checkpoint to {checkpoint_path}")
