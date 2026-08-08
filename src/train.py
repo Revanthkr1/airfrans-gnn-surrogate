@@ -65,6 +65,8 @@ def main(
     lr=1e-3,
     model_kwargs=None,
     checkpoint_every_n_epochs=5,
+    num_workers=2,
+    precision="32-true",
 ):
     """batch_size=1 by default: batching multiple full-resolution graphs (each
     ~180k nodes/~720k edges) into one forward pass blew past a 16GB T4's memory
@@ -87,8 +89,11 @@ def main(
     train_ds = CachedPyGAirfRANSDataset(cache_dir, train_names, stats=stats)
     val_ds = CachedPyGAirfRANSDataset(cache_dir, val_names, stats=stats)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    loader_kwargs = dict(
+        num_workers=num_workers, persistent_workers=num_workers > 0, pin_memory=True
+    )
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)
 
     module = TrainModule(
         stats["target_mean"], stats["target_std"], lr=lr, **(model_kwargs or {})
@@ -103,6 +108,7 @@ def main(
     trainer = L.Trainer(
         max_epochs=max_epochs,
         accelerator="auto",
+        precision=precision,
         log_every_n_steps=10,
         logger=False,
         accumulate_grad_batches=accumulate_grad_batches,
@@ -124,4 +130,5 @@ if __name__ == "__main__":
         checkpoint_path=os.path.join(DATA_ROOT, "meshgraphnet.ckpt"),
         batch_size=1,
         accumulate_grad_batches=4,
+        num_workers=2,
     )
