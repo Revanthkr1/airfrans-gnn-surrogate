@@ -10,6 +10,7 @@ carves its own validation set out of the 800 training cases instead.
 """
 import glob
 import os
+import shutil
 
 import lightning as L
 import numpy as np
@@ -107,6 +108,7 @@ def main(
         stats["target_mean"], stats["target_std"], lr=lr, **(model_kwargs or {})
     )
     checkpoint_dir = os.path.dirname(checkpoint_path)
+    os.makedirs(checkpoint_dir, exist_ok=True)
     periodic_ckpt = ModelCheckpoint(
         dirpath=checkpoint_dir,
         filename="mgn-{epoch:03d}",
@@ -119,6 +121,23 @@ def main(
         # sort order matches numeric order -- last one is the most recent.
         existing = sorted(glob.glob(os.path.join(checkpoint_dir, "mgn-epoch=*.ckpt")))
         resume_from_checkpoint = existing[-1] if existing else None
+
+    if resume_from_checkpoint and os.path.dirname(
+        os.path.abspath(resume_from_checkpoint)
+    ) != os.path.abspath(checkpoint_dir):
+        # Lightning's ModelCheckpoint can end up inferring its save directory from
+        # wherever the *resumed* checkpoint lives, ignoring the dirpath passed above
+        # -- if that's a read-only mount (e.g. a Kaggle input Dataset), every
+        # subsequent periodic save crashes with "Read-only file system" (hit this
+        # for real: resumed from a Kaggle Dataset, epoch 29's save tried writing
+        # back into that same read-only input path). Copying it into checkpoint_dir
+        # first means there's no mismatched directory left to infer wrong.
+        local_resume_path = os.path.join(
+            checkpoint_dir, os.path.basename(resume_from_checkpoint)
+        )
+        shutil.copy2(resume_from_checkpoint, local_resume_path)
+        resume_from_checkpoint = local_resume_path
+
     if resume_from_checkpoint:
         print(f"Resuming from {resume_from_checkpoint}")
 
