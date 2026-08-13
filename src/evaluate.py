@@ -15,19 +15,25 @@ import torch
 from src.data import load_case, split_names
 from src.graph import build_graph
 from src.metrics import relative_l2_per_field
-from src.train import TrainModule
+from src.train import DEFAULT_MODEL_KWARGS, TrainModule
 
 
 def load_trained_model(checkpoint_path, **model_kwargs):
     # target_mean/target_std are only placeholders here (need the right shape,
     # (4,)) -- load_state_dict overwrites these registered buffers with the
     # real values saved in the checkpoint right after construction.
+    #
+    # model_kwargs defaults to DEFAULT_MODEL_KWARGS (src/train.py) -- without
+    # this, TrainModule falls back to MeshGraphNet's own tiny class defaults
+    # (32/64/4) regardless of what the checkpoint was actually trained with,
+    # and load_state_dict fails on a shape mismatch. If you trained with
+    # explicitly different model_kwargs, pass the same ones here.
     module = TrainModule.load_from_checkpoint(
         checkpoint_path,
         target_mean=np.zeros(4),
         target_std=np.ones(4),
         map_location="cpu",
-        **model_kwargs,
+        **(model_kwargs or DEFAULT_MODEL_KWARGS),
     )
     module.eval()
     return module.model
