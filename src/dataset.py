@@ -35,6 +35,11 @@ class AirfRANSGraphDataset:
             )
             surface = simulation.surface
 
+        # Raw (pre-normalization) wall distance -- column 2 of node_features,
+        # see src/graph.py. Needed in physical units for the distance-weighted
+        # loss (src/train.py), so this is captured before normalizing below.
+        wall_distance = node_features[:, 2:3].copy()
+
         if self.stats is not None:
             node_features = (node_features - self.stats["node_mean"]) / self.stats["node_std"]
             targets = (targets - self.stats["target_mean"]) / self.stats["target_std"]
@@ -46,6 +51,7 @@ class AirfRANSGraphDataset:
             "edge_attr": edge_attr,
             "targets": targets,
             "surface": surface,
+            "wall_distance": wall_distance,
         }
 
 
@@ -56,6 +62,8 @@ def to_pyg_data(item):
         edge_attr=torch.tensor(item["edge_attr"], dtype=torch.float32),
         y=torch.tensor(item["targets"], dtype=torch.float32),
         name=item["name"],
+        surface=torch.tensor(item["surface"], dtype=torch.bool),
+        wall_distance=torch.tensor(item["wall_distance"], dtype=torch.float32),
     )
 
 
@@ -98,6 +106,9 @@ class CachedPyGAirfRANSDataset(Dataset):
         # (pre-normalization) position, matching what build_graph() would return.
         position = x[:, :2]
         edge_attr = position[edge_index[1]] - position[edge_index[0]]
+        # Raw wall distance (column 2), captured before x gets normalized below --
+        # needed in physical units for the distance-weighted loss (src/train.py).
+        wall_distance = x[:, 2:3].clone()
 
         if self.stats is not None:
             node_mean = torch.as_tensor(self.stats["node_mean"], dtype=torch.float32)
@@ -113,4 +124,6 @@ class CachedPyGAirfRANSDataset(Dataset):
             edge_attr=edge_attr,
             y=targets,
             name=item["name"],
+            surface=item["surface"].bool(),
+            wall_distance=wall_distance,
         )

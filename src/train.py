@@ -20,7 +20,7 @@ from torch_geometric.loader import DataLoader
 
 from src.data import split_names
 from src.dataset import CachedPyGAirfRANSDataset
-from src.metrics import relative_l2_per_field
+from src.metrics import mean_abs_error_per_field, relative_l2_per_field
 from src.model import MeshGraphNet
 
 # Sized for real GPU training, not the tiny Week-3 local CPU overfit sanity check
@@ -34,27 +34,60 @@ from src.model import MeshGraphNet
 # risking OOM again) -- a smaller, safer step up first.
 DEFAULT_MODEL_KWARGS = {"latent_dim": 64, "hidden_dim": 128, "n_message_passing": 8}
 
+# Surface nodes are only ~0.56% of a typical mesh (1025 of 181794, measured
+# directly) -- a binary "surface-only" weight would also be physically too
+# narrow anyway: wall shear stress (what drag actually depends on) comes from
+# a velocity *gradient* computed over a neighborhood of near-wall points, not
+# just the literal zero-distance surface line. So this weights every node by
+# closeness to the wall (using the already-available wall_distance/sdf
+# feature) instead of a hard surface/not-surface split. LENGTH_SCALE is a
+# heuristic (~5% of the ~1-unit chord), not a precisely derived boundary-layer
+# thickness -- tunable if evaluation shows it's off.
+WALL_WEIGHT_PEAK = 20.0
+WALL_WEIGHT_LENGTH_SCALE = 0.05
+
+
+def distance_weighted_mse(pred, target, wall_distance, peak_weight, length_scale):
+    weight = 1.0 + (peak_weight - 1.0) * torch.exp(-wall_distance / length_scale)
+    return (weight * (pred - target) ** 2).mean()
+
 
 class TrainModule(L.LightningModule):
-    def __init__(self, target_mean, target_std, lr=1e-3, max_epochs=100, **model_kwargs):
+    def __init__(
+        self,
+        target_mean,
+        target_std,
+        lr=1e-3,
+        max_epochs=100,
+        wall_weight_peak=WALL_WEIGHT_PEAK,
+        wall_weight_length_scale=WALL_WEIGHT_LENGTH_SCALE,
+        **model_kwargs,
+    ):
         super().__init__()
         self.model = MeshGraphNet(**model_kwargs)
         self.register_buffer("target_mean", torch.as_tensor(target_mean, dtype=torch.float32))
         self.register_buffer("target_std", torch.as_tensor(target_std, dtype=torch.float32))
         self.lr = lr
         self.max_epochs = max_epochs
+        self.wall_weight_peak = wall_weight_peak
+        self.wall_weight_length_scale = wall_weight_length_scale
 
     def forward(self, batch):
         return self.model(batch.x, batch.edge_index, batch.edge_attr)
 
     def training_step(self, batch, batch_idx):
         pred = self(batch)
-        loss = torch.nn.functional.mse_loss(pred, batch.y)
+        loss = distance_weighted_mse(
+            pred, batch.y, batch.wall_distance, self.wall_weight_peak, self.wall_weight_length_scale
+        )
         self.log("train_loss", loss, batch_size=batch.num_graphs)
         return loss
 
     def validation_step(self, batch, batch_idx):
         pred = self(batch)
+        # Plain (unweighted) loss stays the headline val_loss for comparability
+        # across runs -- the weighting only changes what's optimized, not how
+        # overall convergence is judged.
         loss = torch.nn.functional.mse_loss(pred, batch.y)
         self.log("val_loss", loss, batch_size=batch.num_graphs, prog_bar=True)
 
@@ -62,6 +95,19 @@ class TrainModule(L.LightningModule):
         target_phys = batch.y * self.target_std + self.target_mean
         for field, err in relative_l2_per_field(pred_phys, target_phys).items():
             self.log(f"val_rel_l2_{field}", err, batch_size=batch.num_graphs)
+
+        # Cheap proxy for drag-relevant accuracy, logged every epoch -- unlike
+        # true Cd/Cl (src/evaluate.py), this needs no raw Simulation/mesh object,
+        # just the already-cached surface mask, so it can run inline during
+        # training instead of only as a manual post-hoc checkpoint comparison
+        # (which is what caught the epoch-54-vs-99 regression in the first place).
+        # MAE, not relative L2: velocity (and nu_t) are ~0 at the wall by the
+        # no-slip condition, so relative error's denominator blows up there.
+        surface = batch.surface
+        if surface.any():
+            surf_errors = mean_abs_error_per_field(pred_phys[surface], target_phys[surface])
+            for field, err in surf_errors.items():
+                self.log(f"val_surface_mae_{field}", err, batch_size=batch.num_graphs)
 
     def configure_optimizers(self):
         # Fixed lr=1e-3 for all 100 epochs of the first run likely limited fine
@@ -86,6 +132,8 @@ def main(
     num_workers=2,
     precision="32-true",
     resume_from_checkpoint=None,
+    wall_weight_peak=WALL_WEIGHT_PEAK,
+    wall_weight_length_scale=WALL_WEIGHT_LENGTH_SCALE,
 ):
     """batch_size=1 by default: batching multiple full-resolution graphs (each
     ~180k nodes/~720k edges) into one forward pass blew past a 16GB T4's memory
@@ -125,6 +173,8 @@ def main(
         stats["target_std"],
         lr=lr,
         max_epochs=max_epochs,
+        wall_weight_peak=wall_weight_peak,
+        wall_weight_length_scale=wall_weight_length_scale,
         **(model_kwargs or DEFAULT_MODEL_KWARGS),
     )
     checkpoint_dir = os.path.dirname(checkpoint_path)

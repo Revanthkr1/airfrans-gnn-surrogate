@@ -52,7 +52,8 @@ def main():
         ax.set_title(label)
         ax.legend()
     fig.tight_layout()
-    out_path = os.path.join(os.path.dirname(__file__), "week5_lift_drag.png")
+    ckpt_tag = os.path.splitext(os.path.basename(CHECKPOINT_PATH))[0]
+    out_path = os.path.join(os.path.dirname(__file__), f"week5_lift_drag_{ckpt_tag}.png")
     fig.savefig(out_path, dpi=150)
     print(f"\nSaved {out_path}")
 

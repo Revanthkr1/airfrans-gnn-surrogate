@@ -76,15 +76,43 @@ def evaluate_case(model, dataset_root, name, stats):
 
 
 def evaluate_split(
-    checkpoint_path, dataset_root, stats_path, task="full", log_every=20, **model_kwargs
+    checkpoint_path,
+    dataset_root,
+    stats_path,
+    task="full",
+    log_every=20,
+    names=None,
+    **model_kwargs,
 ):
+    """names: evaluate this explicit list of cases instead of the full official
+    test split -- e.g. a small fixed subset for comparing several checkpoints
+    quickly (see notebooks/compare_checkpoints.py), where running the full
+    200-case split per checkpoint would take ~20-25min each."""
     stats = dict(np.load(stats_path))
     model = load_trained_model(checkpoint_path, **model_kwargs)
-    test_names = split_names(dataset_root, task=task, train=False)
+    if names is None:
+        names = split_names(dataset_root, task=task, train=False)
 
     results = []
-    for i, name in enumerate(test_names):
+    for i, name in enumerate(names):
         results.append(evaluate_case(model, dataset_root, name, stats))
         if (i + 1) % log_every == 0:
-            print(f"evaluated {i + 1}/{len(test_names)}", flush=True)
+            print(f"evaluated {i + 1}/{len(names)}", flush=True)
     return results
+
+
+def summarize(results):
+    """Aggregate a list of evaluate_case() results into headline numbers --
+    mean relative L2 per field, and Cd/Cl relative L2 across the whole set."""
+    summary = {}
+    for field in FIELD_NAMES:
+        errors = [r["field_errors"][field] for r in results]
+        summary[f"{field}_mean"] = float(np.mean(errors))
+
+    cd_pred = np.array([r["cd_pred"] for r in results])
+    cd_ref = np.array([r["cd_ref"] for r in results])
+    cl_pred = np.array([r["cl_pred"] for r in results])
+    cl_ref = np.array([r["cl_ref"] for r in results])
+    summary["cd_rel_l2"] = float(np.linalg.norm(cd_pred - cd_ref) / np.linalg.norm(cd_ref))
+    summary["cl_rel_l2"] = float(np.linalg.norm(cl_pred - cl_ref) / np.linalg.norm(cl_ref))
+    return summary
