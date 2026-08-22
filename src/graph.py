@@ -5,17 +5,24 @@ from scipy.spatial import cKDTree
 
 def build_graph(simulation):
     """
-    Node features: [x, y, wall_distance, inlet_vx, inlet_vy]  (N, 5)
+    Node features: [x, y, wall_distance, inlet_vx, inlet_vy, normal_x, normal_y]  (N, 7)
     Edges: mesh connectivity from the internal mesh, made bidirectional.
     Edge features: relative position (dst - src)  (2*E, 2)
 
+    simulation.normals is a unit vector at surface nodes, [0, 0] everywhere
+    else -- wall_distance alone tells the model *how far* from the wall a
+    node is, but not *which direction* into it, so it can't resolve the
+    boundary layer's anisotropy (very different physics along the wall vs.
+    across it) from that scalar alone.
+
     Returns:
-        node_features: (N, 5) float array
+        node_features: (N, 7) float array
         edge_index: (2, 2*E) int array, row 0 = source, row 1 = destination
         edge_attr: (2*E, 2) float array
     """
     node_features = np.concatenate(
-        [simulation.position, simulation.sdf, simulation.input_velocity], axis=1
+        [simulation.position, simulation.sdf, simulation.input_velocity, simulation.normals],
+        axis=1,
     )
 
     edges_poly = simulation.internal.extract_all_edges()
@@ -40,7 +47,7 @@ def build_subsampled_graph(simulation, n_nodes=2000, k=6, seed=0):
     that happening.
 
     Returns:
-        node_features: (n_nodes, 5), edge_index: (2, n_nodes*k), edge_attr: (n_nodes*k, 2),
+        node_features: (n_nodes, 7), edge_index: (2, n_nodes*k), edge_attr: (n_nodes*k, 2),
         targets: (n_nodes, 4) [vx, vy, pressure, nu_t]
     """
     rng = np.random.default_rng(seed)
@@ -49,7 +56,8 @@ def build_subsampled_graph(simulation, n_nodes=2000, k=6, seed=0):
 
     position = simulation.position[idx]
     node_features = np.concatenate(
-        [position, simulation.sdf[idx], simulation.input_velocity[idx]], axis=1
+        [position, simulation.sdf[idx], simulation.input_velocity[idx], simulation.normals[idx]],
+        axis=1,
     )
 
     tree = cKDTree(position)

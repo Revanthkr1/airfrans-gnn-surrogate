@@ -17,6 +17,7 @@ import numpy as np
 import torch
 from lightning.pytorch.callbacks import ModelCheckpoint
 from torch_geometric.loader import DataLoader
+from torch_geometric.utils import scatter
 
 from src.data import split_names
 from src.dataset import CachedPyGAirfRANSDataset
@@ -46,10 +47,89 @@ DEFAULT_MODEL_KWARGS = {"latent_dim": 64, "hidden_dim": 128, "n_message_passing"
 WALL_WEIGHT_PEAK = 20.0
 WALL_WEIGHT_LENGTH_SCALE = 0.05
 
+# Minimum direction cosine between a candidate edge and the local outward
+# normal for wall_shear_gradient_proxy to use it (see that function's
+# docstring). Deliberately a *cosine* (scale-invariant), not a raw distance --
+# an absolute-length threshold either zeroes out every real edge (too big,
+# confirmed locally: 1e-3 was larger than every real near-wall edge's raw
+# projected length in a test case, ~1e-4 to 7e-4, and filtered out 100% of
+# them) or lets through near-tangent edges whose alignment is only positive
+# due to floating-point noise, dividing by which blows the estimate up by
+# orders of magnitude (confirmed locally: produced a "proxy MSE" of ~1e9).
+# 0.3 requires the edge to point at least somewhat toward straight-out, not
+# just technically away from tangent.
+WSS_PROXY_MIN_COS = 0.3
+# Last-resort floor on the finite-difference denominator itself, purely to
+# avoid a literal division by an exactly-zero-length edge -- not expected to
+# ever actually bind once WSS_PROXY_MIN_COS is filtering by direction.
+WSS_PROXY_MIN_ALIGNMENT = 1e-8
+# Off by default (0.0) and should STAY off -- see ARCHITECTURE.md section 11.
+# A local check of this proxy's edge selection on a real training case found
+# it's not reliable on this dataset's actual mesh topology: for a surface
+# node's neighbors with a positive (outward) cosine to the local normal, the
+# MEDIAN cosine was 0.0002 (i.e. barely distinguishable from tangent) and only
+# 2 edges in the entire ~720k-edge mesh exceeded cos>0.1 -- a genuinely
+# wall-normal-aligned mesh edge into the interior is rare, not the common
+# case this proxy assumed. Before this is trustworthy even as a *logged*
+# diagnostic, it needs validating against AirfRANS's own wall shear stress
+# (Simulation.wallshearstress()) on a held-out case to see if it correlates
+# at all, and likely needs a proper multi-neighbor least-squares gradient
+# (or a KDTree-based nearest-off-wall-point lookup) instead of a single
+# nearest-mesh-edge finite difference. Left in place, inert, for that future
+# work rather than removed outright.
+WSS_PROXY_WEIGHT = 0.0
+
 
 def distance_weighted_mse(pred, target, wall_distance, peak_weight, length_scale):
     weight = 1.0 + (peak_weight - 1.0) * torch.exp(-wall_distance / length_scale)
     return (weight * (pred - target) ** 2).mean()
+
+
+def wall_shear_gradient_proxy(
+    velocity, edge_index, edge_attr, normal, surface, min_cos=WSS_PROXY_MIN_COS, min_alignment=WSS_PROXY_MIN_ALIGNMENT
+):
+    """Cheap, self-consistent proxy for the wall-normal velocity gradient that
+    friction drag (cdv, see ARCHITECTURE.md section 11) actually depends on --
+    NOT AirfRANS's own wall shear stress (that needs a full VTK least-squares
+    neighborhood derivative, impractical to differentiate through every
+    training step). For each mesh edge leaving a surface node whose direction
+    is reasonably aligned with that node's outward normal (cosine > min_cos),
+    project the edge onto the normal and take a one-sided finite difference of
+    velocity along it; average over every such edge per surface node. Only
+    ever compared against this SAME proxy computed from the true velocity
+    field (never against AirfRANS's real wall shear stress value), so the
+    loss is well-posed regardless of how physically accurate the proxy is in
+    absolute terms -- it just has to move the same way true and predicted
+    velocity do.
+
+    Filtering by direction *cosine* rather than raw projected length matters:
+    an absolute-length cutoff either zeroes out every real edge (too big
+    relative to this dataset's near-wall mesh scale) or lets through
+    near-tangent edges whose alignment is positive only from floating-point
+    noise, exploding the estimate when divided by it (both failure modes
+    confirmed in a local smoke test -- see WSS_PROXY_MIN_COS's comment).
+
+    velocity: (N, 2). edge_index: (2, E). edge_attr: (E, 2) = position[dst] -
+    position[src], raw units. normal: (N, 2), raw unit vectors (zero off the
+    surface). surface: (N,) bool.
+    """
+    src, dst = edge_index
+    edge_length = edge_attr.norm(dim=-1)
+    alignment = (edge_attr * normal[src]).sum(dim=-1)  # (E,) projected length
+    cos_theta = alignment / edge_length.clamp(min=min_alignment)
+    valid = surface[src] & (cos_theta > min_cos)
+    if not valid.any():
+        return torch.zeros_like(velocity)
+
+    directional_deriv = (velocity[dst] - velocity[src]) / alignment.clamp(min=min_alignment).unsqueeze(-1)
+
+    idx = src[valid]
+    contrib = directional_deriv[valid]
+    summed = scatter(contrib, idx, dim=0, dim_size=velocity.size(0), reduce="sum")
+    count = scatter(
+        torch.ones(idx.size(0), device=velocity.device), idx, dim=0, dim_size=velocity.size(0), reduce="sum"
+    )
+    return summed / count.clamp(min=1).unsqueeze(-1)
 
 
 class TrainModule(L.LightningModule):
@@ -61,6 +141,8 @@ class TrainModule(L.LightningModule):
         max_epochs=100,
         wall_weight_peak=WALL_WEIGHT_PEAK,
         wall_weight_length_scale=WALL_WEIGHT_LENGTH_SCALE,
+        wss_proxy_weight=WSS_PROXY_WEIGHT,
+        wss_proxy_min_cos=WSS_PROXY_MIN_COS,
         **model_kwargs,
     ):
         super().__init__()
@@ -71,9 +153,29 @@ class TrainModule(L.LightningModule):
         self.max_epochs = max_epochs
         self.wall_weight_peak = wall_weight_peak
         self.wall_weight_length_scale = wall_weight_length_scale
+        self.wss_proxy_weight = wss_proxy_weight
+        self.wss_proxy_min_cos = wss_proxy_min_cos
 
     def forward(self, batch):
         return self.model(batch.x, batch.edge_index, batch.edge_attr)
+
+    def _wss_proxy_mse(self, pred_phys, target_phys, batch):
+        # Physical-unit velocity in, physical-unit velocity out -- edge_attr
+        # and normal are already raw (see src/dataset.py), and the gradient
+        # estimate itself is only meaningful in physical units (chord-scale
+        # distances, not per-feature-normalized ones).
+        wss_pred = wall_shear_gradient_proxy(
+            pred_phys[:, :2], batch.edge_index, batch.edge_attr, batch.normal, batch.surface,
+            min_cos=self.wss_proxy_min_cos,
+        )
+        wss_true = wall_shear_gradient_proxy(
+            target_phys[:, :2], batch.edge_index, batch.edge_attr, batch.normal, batch.surface,
+            min_cos=self.wss_proxy_min_cos,
+        )
+        surface = batch.surface
+        if not surface.any():
+            return torch.zeros((), device=pred_phys.device)
+        return torch.nn.functional.mse_loss(wss_pred[surface], wss_true[surface])
 
     def training_step(self, batch, batch_idx):
         pred = self(batch)
@@ -81,6 +183,17 @@ class TrainModule(L.LightningModule):
             pred, batch.y, batch.wall_distance, self.wall_weight_peak, self.wall_weight_length_scale
         )
         self.log("train_loss", loss, batch_size=batch.num_graphs)
+
+        # Always computed and logged, even at the default weight of 0, so the
+        # raw (unweighted) scale is visible from the first real run -- see
+        # WSS_PROXY_WEIGHT's docstring note on picking a weight from that.
+        pred_phys = pred * self.target_std + self.target_mean
+        target_phys = batch.y * self.target_std + self.target_mean
+        wss_mse = self._wss_proxy_mse(pred_phys, target_phys, batch)
+        self.log("train_wss_proxy_mse", wss_mse, batch_size=batch.num_graphs)
+        if self.wss_proxy_weight > 0:
+            loss = loss + self.wss_proxy_weight * wss_mse
+
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -108,6 +221,23 @@ class TrainModule(L.LightningModule):
             surf_errors = mean_abs_error_per_field(pred_phys[surface], target_phys[surface])
             for field, err in surf_errors.items():
                 self.log(f"val_surface_mae_{field}", err, batch_size=batch.num_graphs)
+            # Single scalar for ModelCheckpoint's `monitor` (see best_surface_ckpt,
+            # main() below) -- val_loss/val_rel_l2_* improved every epoch through
+            # epoch 91 while true Cd relative L2 (src/evaluate.py) got worse after
+            # epoch 47 (see project history), so neither is a safe stand-in for
+            # "pick the checkpoint to actually ship." This surface-MAE average is
+            # the cheapest available proxy that's shown to track the same
+            # regression without needing the full Simulation/force_coefficient()
+            # pass per case.
+            surf_mae_mean = sum(surf_errors.values()) / len(surf_errors)
+            self.log("val_surface_mae_mean", surf_mae_mean, batch_size=batch.num_graphs)
+
+        # Not folded into val_surface_mae_mean / best_surface_ckpt's monitor --
+        # this proxy is new and unvalidated (ARCHITECTURE.md section 11),
+        # logged separately so it can be inspected without changing the
+        # already-working checkpoint-selection criterion.
+        wss_mse = self._wss_proxy_mse(pred_phys, target_phys, batch)
+        self.log("val_wss_proxy_mse", wss_mse, batch_size=batch.num_graphs)
 
     def configure_optimizers(self):
         # Fixed lr=1e-3 for all 100 epochs of the first run likely limited fine
@@ -134,6 +264,8 @@ def main(
     resume_from_checkpoint=None,
     wall_weight_peak=WALL_WEIGHT_PEAK,
     wall_weight_length_scale=WALL_WEIGHT_LENGTH_SCALE,
+    wss_proxy_weight=WSS_PROXY_WEIGHT,
+    wss_proxy_min_cos=WSS_PROXY_MIN_COS,
 ):
     """batch_size=1 by default: batching multiple full-resolution graphs (each
     ~180k nodes/~720k edges) into one forward pass blew past a 16GB T4's memory
@@ -175,6 +307,8 @@ def main(
         max_epochs=max_epochs,
         wall_weight_peak=wall_weight_peak,
         wall_weight_length_scale=wall_weight_length_scale,
+        wss_proxy_weight=wss_proxy_weight,
+        wss_proxy_min_cos=wss_proxy_min_cos,
         **(model_kwargs or DEFAULT_MODEL_KWARGS),
     )
     checkpoint_dir = os.path.dirname(checkpoint_path)
@@ -184,6 +318,20 @@ def main(
         filename="mgn-{epoch:03d}",
         every_n_epochs=checkpoint_every_n_epochs,
         save_top_k=-1,  # keep all of them -- checkpoints are a few MB, not worth pruning
+    )
+    # Task-metric selection, not "last epoch wins": every field-level metric and
+    # val_loss improved monotonically through epoch 91 of the weighted-loss run
+    # while true Cd relative L2 bottomed out at epoch 47 and got worse after --
+    # picking the final checkpoint would ship a worse-drag model than one from
+    # partway through training. val_surface_mae_mean is a cheap per-epoch proxy
+    # for that downstream metric; this callback tracks the single best epoch by
+    # it automatically instead of relying on a manual post-hoc sweep every run.
+    best_surface_ckpt = ModelCheckpoint(
+        dirpath=checkpoint_dir,
+        filename="mgn-best-surface-mae",
+        monitor="val_surface_mae_mean",
+        mode="min",
+        save_top_k=1,
     )
 
     if resume_from_checkpoint is None:
@@ -218,7 +366,7 @@ def main(
         log_every_n_steps=10,
         logger=False,
         accumulate_grad_batches=accumulate_grad_batches,
-        callbacks=[periodic_ckpt],
+        callbacks=[periodic_ckpt, best_surface_ckpt],
     )
     trainer.fit(module, train_loader, val_loader, ckpt_path=resume_from_checkpoint)
 

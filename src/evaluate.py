@@ -14,8 +14,71 @@ import torch
 
 from src.data import load_case, split_names
 from src.graph import build_graph
-from src.metrics import relative_l2_per_field
+from src.metrics import FIELD_NAMES, mean_abs_error_per_field, relative_l2_per_field
 from src.train import DEFAULT_MODEL_KWARGS, TrainModule
+
+# Near-wall band, in chord units -- distinct from the literal `surface` mask
+# (sdf==0 exactly, ~0.56% of nodes). Not the same length scale as training's
+# WALL_WEIGHT_LENGTH_SCALE=0.05 (src/train.py): that's a smooth decay for
+# loss weighting, and 61% of a typical mesh already falls under sdf<0.05 (RANS
+# meshes cluster nodes tightly near the wall for boundary-layer resolution) --
+# too broad to call "near-wall" as a region label. 0.01 is still large enough
+# to have real coverage (~47% of nodes) while narrower than the 0.05 decay.
+NEAR_WALL_THRESHOLD = 0.01
+# Wake band: downstream of the trailing edge (chord runs x in [0, 1]), within
+# a fixed y half-width of the centerline. This is a simplification -- it
+# doesn't account for the wake deflecting at nonzero angle of attack, so at
+# high AoA some true wake gets misclassified as far-field -- good enough for
+# a diagnostic breakdown, not a precise wake extraction.
+WAKE_X_THRESHOLD = 1.0
+WAKE_Y_HALFWIDTH = 0.15
+
+
+def regional_errors(
+    pred,
+    target,
+    wall_distance,
+    position,
+    surface,
+    near_wall_threshold=NEAR_WALL_THRESHOLD,
+    wake_x_threshold=WAKE_X_THRESHOLD,
+    wake_y_halfwidth=WAKE_Y_HALFWIDTH,
+):
+    """pred, target: (N, 4) numpy arrays in physical units. Buckets nodes into
+    surface / near_wall / wake / far_field and reports the error appropriate
+    to each -- MAE at/near the wall (velocity, and nu_t, are ~0 there by the
+    no-slip condition, so relative L2's denominator blows up -- same reasoning
+    as mean_abs_error_per_field's docstring), relative L2 elsewhere.
+    """
+    wall_distance = np.asarray(wall_distance).reshape(-1)
+    surface = np.asarray(surface).reshape(-1).astype(bool)
+    x, y = position[:, 0], position[:, 1]
+
+    near_wall = (~surface) & (wall_distance < near_wall_threshold)
+    wake = (
+        ~surface
+        & ~near_wall
+        & (x > wake_x_threshold)
+        & (np.abs(y) < wake_y_halfwidth)
+    )
+    far_field = ~surface & ~near_wall & ~wake
+
+    out = {}
+    for region_name, mask, use_mae in [
+        ("surface", surface, True),
+        ("near_wall", near_wall, True),
+        ("wake", wake, False),
+        ("far_field", far_field, False),
+    ]:
+        if not mask.any():
+            continue
+        p, t = torch.tensor(pred[mask]), torch.tensor(target[mask])
+        out[region_name] = {
+            "n": int(mask.sum()),
+            "errors": mean_abs_error_per_field(p, t) if use_mae else relative_l2_per_field(p, t),
+            "metric": "mae" if use_mae else "rel_l2",
+        }
+    return out
 
 
 def load_trained_model(checkpoint_path, **model_kwargs):
@@ -57,21 +120,42 @@ def evaluate_case(model, dataset_root, name, stats):
         [simulation.velocity, simulation.pressure, simulation.nu_t], axis=1
     )
     field_errors = relative_l2_per_field(torch.tensor(pred), torch.tensor(target))
+    region_errors = regional_errors(
+        pred, target, node_features[:, 2:3], simulation.position, simulation.surface
+    )
 
     # Overwriting these doesn't touch the underlying VTU-loaded mesh data --
     # force_coefficient(reference=True) reads that directly, unaffected.
     simulation.velocity = pred[:, :2]
     simulation.pressure = pred[:, 2:3]
-    (cd_pred, _, _), (cl_pred, _, _) = simulation.force_coefficient(reference=False)
-    (cd_ref, _, _), (cl_ref, _, _) = simulation.force_coefficient(reference=True)
+    # cdp/cdv split pressure drag (needs only the predicted pressure field)
+    # from viscous/friction drag (needs the wall-normal *gradient* of the
+    # predicted velocity field, a noisier quantity than the field itself) --
+    # keeping both instead of just the summed cd/cl lets us tell which half
+    # is actually driving a Cd regression instead of guessing.
+    (cd_pred, cdp_pred, cdv_pred), (cl_pred, clp_pred, clv_pred) = simulation.force_coefficient(
+        reference=False
+    )
+    (cd_ref, cdp_ref, cdv_ref), (cl_ref, clp_ref, clv_ref) = simulation.force_coefficient(
+        reference=True
+    )
 
     return {
         "name": name,
         "field_errors": field_errors,
+        "region_errors": region_errors,
         "cd_pred": float(cd_pred),
         "cd_ref": float(cd_ref),
         "cl_pred": float(cl_pred),
         "cl_ref": float(cl_ref),
+        "cdp_pred": float(cdp_pred),
+        "cdp_ref": float(cdp_ref),
+        "cdv_pred": float(cdv_pred),
+        "cdv_ref": float(cdv_ref),
+        "clp_pred": float(clp_pred),
+        "clp_ref": float(clp_ref),
+        "clv_pred": float(clv_pred),
+        "clv_ref": float(clv_ref),
     }
 
 
@@ -115,4 +199,41 @@ def summarize(results):
     cl_ref = np.array([r["cl_ref"] for r in results])
     summary["cd_rel_l2"] = float(np.linalg.norm(cd_pred - cd_ref) / np.linalg.norm(cd_ref))
     summary["cl_rel_l2"] = float(np.linalg.norm(cl_pred - cl_ref) / np.linalg.norm(cl_ref))
+
+    # Split by contribution -- pressure drag (cdp, needs only the predicted
+    # pressure field) vs. friction drag (cdv, needs the wall-normal *gradient*
+    # of the predicted velocity field). Reported separately, never blended
+    # into the summed cd/cl above, since they can regress independently (see
+    # ARCHITECTURE.md section 10) and a fixed cd_rel_l2 number can't show that.
+    for prefix in ("cdp", "cdv", "clp", "clv"):
+        pred = np.array([r[f"{prefix}_pred"] for r in results])
+        ref = np.array([r[f"{prefix}_ref"] for r in results])
+        summary[f"{prefix}_rel_l2"] = float(np.linalg.norm(pred - ref) / np.linalg.norm(ref))
+
+    # Sanity check: negative predicted Cd is physically impossible (see
+    # project history's cancellation-failure discussion) -- if this is ever
+    # true, the model has stopped predicting drag and started predicting noise.
+    summary["cd_pred_min"] = float(cd_pred.min())
+    summary["cd_pred_max"] = float(cd_pred.max())
+    summary["any_negative_cd_pred"] = bool((cd_pred < 0).any())
+    return summary
+
+
+def summarize_regions(results):
+    """Mean, across cases, of each region's per-field error (see
+    regional_errors) -- same simple-average-across-cases convention as
+    summarize(), just broken out by surface/near_wall/wake/far_field instead
+    of pooling every node together."""
+    region_names = results[0]["region_errors"].keys()
+    summary = {}
+    for region_name in region_names:
+        metric = results[0]["region_errors"][region_name]["metric"]
+        summary[region_name] = {"metric": metric, "fields": {}}
+        for field in FIELD_NAMES:
+            errors = [
+                r["region_errors"][region_name]["errors"][field]
+                for r in results
+                if region_name in r["region_errors"]
+            ]
+            summary[region_name]["fields"][field] = float(np.mean(errors))
     return summary

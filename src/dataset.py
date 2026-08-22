@@ -39,6 +39,11 @@ class AirfRANSGraphDataset:
         # see src/graph.py. Needed in physical units for the distance-weighted
         # loss (src/train.py), so this is captured before normalizing below.
         wall_distance = node_features[:, 2:3].copy()
+        # Raw (pre-normalization) surface normal -- columns 5:7. Needed as an
+        # actual direction vector for the wall-shear-gradient proxy loss
+        # (src/train.py) -- normalizing a unit vector by subtracting a mean
+        # and dividing by a std would distort it away from being a direction.
+        normal = node_features[:, 5:7].copy()
 
         if self.stats is not None:
             node_features = (node_features - self.stats["node_mean"]) / self.stats["node_std"]
@@ -52,6 +57,7 @@ class AirfRANSGraphDataset:
             "targets": targets,
             "surface": surface,
             "wall_distance": wall_distance,
+            "normal": normal,
         }
 
 
@@ -64,6 +70,7 @@ def to_pyg_data(item):
         name=item["name"],
         surface=torch.tensor(item["surface"], dtype=torch.bool),
         wall_distance=torch.tensor(item["wall_distance"], dtype=torch.float32),
+        normal=torch.tensor(item["normal"], dtype=torch.float32),
     )
 
 
@@ -109,6 +116,9 @@ class CachedPyGAirfRANSDataset(Dataset):
         # Raw wall distance (column 2), captured before x gets normalized below --
         # needed in physical units for the distance-weighted loss (src/train.py).
         wall_distance = x[:, 2:3].clone()
+        # Raw surface normal (columns 5:7) -- a real direction vector, so it
+        # must stay unnormalized (see AirfRANSGraphDataset.__getitem__ above).
+        normal = x[:, 5:7].clone()
 
         if self.stats is not None:
             node_mean = torch.as_tensor(self.stats["node_mean"], dtype=torch.float32)
@@ -126,4 +136,5 @@ class CachedPyGAirfRANSDataset(Dataset):
             name=item["name"],
             surface=item["surface"].bool(),
             wall_distance=wall_distance,
+            normal=normal,
         )

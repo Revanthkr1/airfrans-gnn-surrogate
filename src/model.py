@@ -36,7 +36,7 @@ class GraphNetBlock(nn.Module):
 class MeshGraphNet(nn.Module):
     def __init__(
         self,
-        node_in_dim=5,
+        node_in_dim=7,
         edge_in_dim=2,
         out_dim=4,
         latent_dim=32,

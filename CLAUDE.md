@@ -42,4 +42,4 @@ Out of scope for now: PINNs beyond one toy exercise, transient simulation, multi
 - GitHub Copilot (if active) handles inline autocomplete/boilerplate in the editor.
   Don't run both against the same file at the same time.
 - Judging whether a resulting drag/lift error is physically plausible is the user's call,
-  not something to automate away.
+  not something to automate away. 
