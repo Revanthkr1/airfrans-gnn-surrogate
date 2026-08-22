@@ -106,19 +106,24 @@ class CachedPyGAirfRANSDataset(Dataset):
     def get(self, idx):
         name = self.names[idx]
         item = torch.load(cache_path(self.cache_dir, name), weights_only=True)
-        x, targets = item["node_features"], item["targets"]
+        x5, targets = item["node_features"], item["targets"]
         edge_index = item["edge_index"].long()  # PyG requires int64 edge_index
+        surface = item["surface"].bool()
 
         # edge_attr isn't cached (see src/preprocess.py) -- recompute from RAW
         # (pre-normalization) position, matching what build_graph() would return.
-        position = x[:, :2]
+        position = x5[:, :2]
         edge_attr = position[edge_index[1]] - position[edge_index[0]]
-        # Raw wall distance (column 2), captured before x gets normalized below --
-        # needed in physical units for the distance-weighted loss (src/train.py).
-        wall_distance = x[:, 2:3].clone()
-        # Raw surface normal (columns 5:7) -- a real direction vector, so it
+        # Raw wall distance (column 2) -- needed in physical units for the
+        # distance-weighted loss (src/train.py).
+        wall_distance = x5[:, 2:3].clone()
+        # normal isn't cached densely (see src/preprocess.py -- it's ~0.5%
+        # nonzero) -- scatter the cached surface-only rows back into a full
+        # (N, 2) array using the surface mask. A real direction vector, so it
         # must stay unnormalized (see AirfRANSGraphDataset.__getitem__ above).
-        normal = x[:, 5:7].clone()
+        normal = torch.zeros(x5.size(0), 2, dtype=x5.dtype)
+        normal[surface] = item["normal_at_surface"]
+        x = torch.cat([x5, normal], dim=1)
 
         if self.stats is not None:
             node_mean = torch.as_tensor(self.stats["node_mean"], dtype=torch.float32)
@@ -134,7 +139,7 @@ class CachedPyGAirfRANSDataset(Dataset):
             edge_attr=edge_attr,
             y=targets,
             name=item["name"],
-            surface=item["surface"].bool(),
+            surface=surface,
             wall_distance=wall_distance,
             normal=normal,
         )

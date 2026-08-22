@@ -35,19 +35,36 @@ def preprocess_case(dataset_root, name, cache_dir, delete_raw_after=False):
         # two changes take a case from ~24MB to ~12MB, which mattered once a Colab
         # disk filled up caching the full 800-case split.
         node_features, edge_index, _ = build_graph(simulation)
+        surface = simulation.surface
+        # normal (columns 5:7 of node_features, see src/graph.py) is exactly
+        # zero everywhere except the ~0.5% of nodes on the surface -- caching
+        # it densely would nearly double node_features' on-disk size for
+        # almost all zeros. Store only the surface rows; CachedPyGAirfRANSDataset
+        # reconstructs the full (N, 2) array by scattering back using the
+        # already-cached `surface` mask.
+        normal_at_surface = node_features[surface, 5:7]
+        node_features = node_features[:, :5]
         targets = np.concatenate(
             [simulation.velocity, simulation.pressure, simulation.nu_t], axis=1
         )
-        torch.save(
-            {
-                "node_features": torch.tensor(node_features, dtype=torch.float32),
-                "edge_index": torch.tensor(edge_index, dtype=torch.int32),
-                "targets": torch.tensor(targets, dtype=torch.float32),
-                "surface": torch.tensor(simulation.surface),
-                "name": name,
-            },
-            out_path,
-        )
+        payload = {
+            "node_features": torch.tensor(node_features, dtype=torch.float32),
+            "normal_at_surface": torch.tensor(normal_at_surface, dtype=torch.float32),
+            "edge_index": torch.tensor(edge_index, dtype=torch.int32),
+            "targets": torch.tensor(targets, dtype=torch.float32),
+            "surface": torch.tensor(surface),
+            "name": name,
+        }
+        # Write to a temp path then rename, not directly to out_path: an
+        # interrupted torch.save (disk full, session timeout/kill) would
+        # otherwise leave a truncated .pt file that still satisfies
+        # os.path.exists() above, silently skipping this case forever on
+        # every future call instead of ever re-caching it. rename() is
+        # atomic on the same filesystem, so out_path only ever exists once
+        # the write has actually finished.
+        tmp_path = out_path + ".tmp"
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, out_path)
 
     if delete_raw_after:
         shutil.rmtree(os.path.join(dataset_root, name), ignore_errors=True)
