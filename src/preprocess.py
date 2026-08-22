@@ -33,7 +33,8 @@ def preprocess_case(dataset_root, name, cache_dir, delete_raw_after=False):
         # edge_index as int32 (not PyG's usual int64): node counts are ~180k, well
         # under int32 range, and it's the single biggest piece of the cache -- these
         # two changes take a case from ~24MB to ~12MB, which mattered once a Colab
-        # disk filled up caching the full 800-case split.
+        # disk filled up caching the full 800-case split. Sparse normal storage and
+        # float16 (below) take it down further, to ~9MB -- see their own comments.
         node_features, edge_index, _ = build_graph(simulation)
         surface = simulation.surface
         # normal (columns 5:7 of node_features, see src/graph.py) is exactly
@@ -47,11 +48,22 @@ def preprocess_case(dataset_root, name, cache_dir, delete_raw_after=False):
         targets = np.concatenate(
             [simulation.velocity, simulation.pressure, simulation.nu_t], axis=1
         )
+        # float16 on disk, not float32: halves node_features/targets/normal's
+        # footprint. Cast back to float32 immediately on load
+        # (CachedPyGAirfRANSDataset.get()) so training math is unaffected --
+        # this only shrinks the on-disk representation, and the project
+        # already trains under precision="16-mixed" on Kaggle/Colab anyway,
+        # so it isn't introducing a new precision regime. Needed for real
+        # headroom against the raw zip (9.34GB, undeletable until every case
+        # has been extracted from it -- see stream_preprocess_from_zip)
+        # sitting on disk *simultaneously* with the growing cache for the
+        # entire preprocessing run: this combination hit Kaggle's disk quota
+        # at 750/800 cases even after normals were already stored sparsely.
         payload = {
-            "node_features": torch.tensor(node_features, dtype=torch.float32),
-            "normal_at_surface": torch.tensor(normal_at_surface, dtype=torch.float32),
+            "node_features": torch.tensor(node_features, dtype=torch.float16),
+            "normal_at_surface": torch.tensor(normal_at_surface, dtype=torch.float16),
             "edge_index": torch.tensor(edge_index, dtype=torch.int32),
-            "targets": torch.tensor(targets, dtype=torch.float32),
+            "targets": torch.tensor(targets, dtype=torch.float16),
             "surface": torch.tensor(surface),
             "name": name,
         }

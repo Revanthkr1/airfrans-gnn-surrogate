@@ -106,7 +106,13 @@ class CachedPyGAirfRANSDataset(Dataset):
     def get(self, idx):
         name = self.names[idx]
         item = torch.load(cache_path(self.cache_dir, name), weights_only=True)
-        x5, targets = item["node_features"], item["targets"]
+        # Cached as float16 on disk (src/preprocess.py) -- cast up to float32
+        # immediately so every downstream computation (normalization, model
+        # forward/backward, the distance-weighted and wss-proxy losses) runs
+        # at the same precision it always has; only the on-disk footprint
+        # changed, not the training math.
+        x5 = item["node_features"].float()
+        targets = item["targets"].float()
         edge_index = item["edge_index"].long()  # PyG requires int64 edge_index
         surface = item["surface"].bool()
 
@@ -122,7 +128,7 @@ class CachedPyGAirfRANSDataset(Dataset):
         # (N, 2) array using the surface mask. A real direction vector, so it
         # must stay unnormalized (see AirfRANSGraphDataset.__getitem__ above).
         normal = torch.zeros(x5.size(0), 2, dtype=x5.dtype)
-        normal[surface] = item["normal_at_surface"]
+        normal[surface] = item["normal_at_surface"].float()
         x = torch.cat([x5, normal], dim=1)
 
         if self.stats is not None:
