@@ -10,6 +10,7 @@ carves its own validation set out of the 800 training cases instead.
 """
 import glob
 import os
+import re
 import shutil
 
 import lightning as L
@@ -332,7 +333,16 @@ def main(
     os.makedirs(checkpoint_dir, exist_ok=True)
     periodic_ckpt = ModelCheckpoint(
         dirpath=checkpoint_dir,
-        filename="mgn-{epoch:03d}",
+        # Explicit "epoch=" in the template + auto_insert_metric_name=False,
+        # not relying on Lightning's own auto-insertion of "name=" before a
+        # placeholder -- that behavior isn't pinned across Lightning versions
+        # (Kaggle's `pip install lightning` has no version pin), and a run
+        # whose installed version doesn't auto-insert "=" silently produces
+        # "mgn-epoch009.ckpt" instead of "mgn-epoch=009.ckpt". The resume glob
+        # below then finds nothing and every restart silently begins at epoch
+        # 0 instead of resuming -- confirmed hitting this for real.
+        filename="mgn-epoch={epoch:03d}",
+        auto_insert_metric_name=False,
         every_n_epochs=checkpoint_every_n_epochs,
         save_top_k=-1,  # keep all of them -- checkpoints are a few MB, not worth pruning
     )
@@ -352,10 +362,23 @@ def main(
     )
 
     if resume_from_checkpoint is None:
-        # filenames zero-pad the epoch number (mgn-epoch=003.ckpt), so lexicographic
-        # sort order matches numeric order -- last one is the most recent.
-        existing = sorted(glob.glob(os.path.join(checkpoint_dir, "mgn-epoch=*.ckpt")))
-        resume_from_checkpoint = existing[-1] if existing else None
+        # Matches both "mgn-epoch=003.ckpt" (this version's explicit template
+        # above) and "mgn-epoch003.ckpt" (older runs / environments where
+        # Lightning's auto_insert_metric_name didn't add the "=") -- a run
+        # resuming a checkpoint directory from before this fix must still
+        # find it, not silently restart at epoch 0. Sorted by the extracted
+        # epoch NUMBER, not lexicographically -- "=" (0x3D) sorts after every
+        # digit character, so a plain string sort would put "mgn-epoch009"
+        # ahead of "mgn-epoch=015" and pick the wrong "latest" whenever both
+        # naming styles coexist in the same directory.
+        existing = glob.glob(os.path.join(checkpoint_dir, "mgn-epoch*.ckpt"))
+        with_epoch = []
+        for path in existing:
+            match = re.search(r"epoch=?(\d+)\.ckpt$", os.path.basename(path))
+            if match:
+                with_epoch.append((int(match.group(1)), path))
+        with_epoch.sort(key=lambda item: item[0])
+        resume_from_checkpoint = with_epoch[-1][1] if with_epoch else None
 
     if resume_from_checkpoint and os.path.dirname(
         os.path.abspath(resume_from_checkpoint)
