@@ -473,3 +473,31 @@ KDTree-based nearest-off-wall-point lookup instead of raw mesh-edge
 adjacency, and should be validated by correlating it against
 `Simulation.wallshearstress()` on a real case *before* it's ever wired into
 a training loss again, not after.
+
+**A real training run was silently broken by this "inert" feature anyway.**
+`train_wss_proxy_mse` was computed and logged *unconditionally* every step,
+even at `wss_proxy_weight=0.0`, so its raw scale would be visible from the
+first real run without needing to enable it. That reasoning missed the
+actual risk: Kaggle trains under `precision="16-mixed"` (fp16, max
+representable value ~65504), and this proxy is exactly the computation
+already shown above to blow up to values in the hundreds of millions from a
+single near-zero mesh-edge division. Comparing the raw checkpoint files
+directly (`torch.load`, not through any project code) from the normals-run:
+epoch 14 (`global_step=2700`) and epoch 29 (`global_step=5400`) have
+byte-identical `state_dict`s — 2700 optimizer steps producing *zero*
+parameter change. The proxy's fp16 overflow to `inf`, even though never
+added to the actual loss, appears to have poisoned PyTorch's AMP gradient
+scaler into perpetually skipping every subsequent optimizer step. Training
+kept running, checkpoints kept saving, nothing crashed — it just silently
+stopped learning somewhere around epoch 4–14.
+
+Fixed: both `training_step` and `validation_step` now only compute the
+proxy at all when `wss_proxy_weight > 0` (true "off means off," not
+"computed but not added to the loss"), and `wall_shear_gradient_proxy`
+itself now hard-clamps its output (`WSS_PROXY_MAX_ABS = 50.0`) so it can
+never overflow fp16 even when deliberately enabled before the proper
+validation above has been done. Lesson: "compute a diagnostic for
+visibility, don't act on it" is not actually inert under mixed-precision
+training if the diagnostic itself can produce extreme values — the fix
+needed to prevent the extreme value from being computed at all, not just
+prevent it from reaching the loss.

@@ -63,6 +63,18 @@ WSS_PROXY_MIN_COS = 0.3
 # avoid a literal division by an exactly-zero-length edge -- not expected to
 # ever actually bind once WSS_PROXY_MIN_COS is filtering by direction.
 WSS_PROXY_MIN_ALIGNMENT = 1e-8
+# Hard clamp on the proxy's per-component output. This is what should have
+# been here from the start: a real Kaggle run silently froze at ~2700
+# optimizer steps because this proxy is computed under precision="16-mixed"
+# (fp16 max ~65504), and a division by a near-zero denominator on a real
+# mesh edge produced a value in the hundreds of millions -- overflowing to
+# inf and poisoning the AMP gradient scaler into skipping every subsequent
+# step, even though the term was never added to the loss (weight was 0).
+# 50 keeps (pred - true)^2 comfortably under fp16's range with real margin;
+# this proxy is explicitly not trusted for precision anyway (see the
+# WSS_PROXY_WEIGHT docstring), so clamping this aggressively costs nothing
+# real.
+WSS_PROXY_MAX_ABS = 50.0
 # Off by default (0.0) and should STAY off -- see ARCHITECTURE.md section 11.
 # A local check of this proxy's edge selection on a real training case found
 # it's not reliable on this dataset's actual mesh topology: for a surface
@@ -122,6 +134,7 @@ def wall_shear_gradient_proxy(
         return torch.zeros_like(velocity)
 
     directional_deriv = (velocity[dst] - velocity[src]) / alignment.clamp(min=min_alignment).unsqueeze(-1)
+    directional_deriv = directional_deriv.clamp(min=-WSS_PROXY_MAX_ABS, max=WSS_PROXY_MAX_ABS)
 
     idx = src[valid]
     contrib = directional_deriv[valid]
@@ -184,14 +197,14 @@ class TrainModule(L.LightningModule):
         )
         self.log("train_loss", loss, batch_size=batch.num_graphs)
 
-        # Always computed and logged, even at the default weight of 0, so the
-        # raw (unweighted) scale is visible from the first real run -- see
-        # WSS_PROXY_WEIGHT's docstring note on picking a weight from that.
-        pred_phys = pred * self.target_std + self.target_mean
-        target_phys = batch.y * self.target_std + self.target_mean
-        wss_mse = self._wss_proxy_mse(pred_phys, target_phys, batch)
-        self.log("train_wss_proxy_mse", wss_mse, batch_size=batch.num_graphs)
+        # Gated on weight > 0, NOT "always computed for visibility" (that was
+        # the actual bug, see below) -- only touch pred_phys/target_phys and
+        # run the proxy at all when it's going to be used.
         if self.wss_proxy_weight > 0:
+            pred_phys = pred * self.target_std + self.target_mean
+            target_phys = batch.y * self.target_std + self.target_mean
+            wss_mse = self._wss_proxy_mse(pred_phys, target_phys, batch)
+            self.log("train_wss_proxy_mse", wss_mse, batch_size=batch.num_graphs)
             loss = loss + self.wss_proxy_weight * wss_mse
 
         return loss
@@ -232,12 +245,16 @@ class TrainModule(L.LightningModule):
             surf_mae_mean = sum(surf_errors.values()) / len(surf_errors)
             self.log("val_surface_mae_mean", surf_mae_mean, batch_size=batch.num_graphs)
 
-        # Not folded into val_surface_mae_mean / best_surface_ckpt's monitor --
-        # this proxy is new and unvalidated (ARCHITECTURE.md section 11),
-        # logged separately so it can be inspected without changing the
-        # already-working checkpoint-selection criterion.
-        wss_mse = self._wss_proxy_mse(pred_phys, target_phys, batch)
-        self.log("val_wss_proxy_mse", wss_mse, batch_size=batch.num_graphs)
+        # Gated on weight > 0, same as training_step -- see that comment for
+        # why "always compute, just for visibility" was the actual bug that
+        # froze a real Kaggle run's weights for 2700+ steps (ARCHITECTURE.md
+        # section 11 update). Not folded into val_surface_mae_mean /
+        # best_surface_ckpt's monitor even when enabled -- this proxy is
+        # still unvalidated, logged separately so it can be inspected
+        # without changing the already-working checkpoint-selection criterion.
+        if self.wss_proxy_weight > 0:
+            wss_mse = self._wss_proxy_mse(pred_phys, target_phys, batch)
+            self.log("val_wss_proxy_mse", wss_mse, batch_size=batch.num_graphs)
 
     def configure_optimizers(self):
         # Fixed lr=1e-3 for all 100 epochs of the first run likely limited fine
