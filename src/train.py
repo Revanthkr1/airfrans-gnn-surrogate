@@ -397,6 +397,24 @@ def main(
         resume_from_checkpoint = local_resume_path
 
     if resume_from_checkpoint:
+        # A checkpoint saves each callback's OWN internal state (e.g.
+        # ModelCheckpoint's best_model_path/kth_best_model_path), not just
+        # model/optimizer/epoch state -- if ANY past run ever pointed
+        # best_surface_ckpt's dirpath somewhere that's since become
+        # unwritable (e.g. a read-only Kaggle input Dataset -- hit this for
+        # real: resuming from a checkpoint saved after that pointed
+        # best_surface_ckpt back at the read-only mount, even though THIS
+        # run's dirpath is correctly under checkpoint_dir), that stale path
+        # gets restored into the live callback on resume and the next save
+        # crashes. This is a different failure mode than the directory copy
+        # above -- that only fixes the resumed FILE's own location, not
+        # state saved *inside* it. Stripping "callbacks" here costs only
+        # each ModelCheckpoint's "best score so far" bookkeeping, never the
+        # model/optimizer/epoch state actually needed to resume correctly.
+        ckpt = torch.load(resume_from_checkpoint, map_location="cpu", weights_only=False)
+        if ckpt.get("callbacks"):
+            ckpt["callbacks"] = {}
+            torch.save(ckpt, resume_from_checkpoint)
         print(f"Resuming from {resume_from_checkpoint}")
 
     trainer = L.Trainer(
