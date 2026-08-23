@@ -380,41 +380,38 @@ def main(
         with_epoch.sort(key=lambda item: item[0])
         resume_from_checkpoint = with_epoch[-1][1] if with_epoch else None
 
-    if resume_from_checkpoint and os.path.dirname(
-        os.path.abspath(resume_from_checkpoint)
-    ) != os.path.abspath(checkpoint_dir):
-        # Lightning's ModelCheckpoint can end up inferring its save directory from
-        # wherever the *resumed* checkpoint lives, ignoring the dirpath passed above
-        # -- if that's a read-only mount (e.g. a Kaggle input Dataset), every
-        # subsequent periodic save crashes with "Read-only file system" (hit this
-        # for real: resumed from a Kaggle Dataset, epoch 29's save tried writing
-        # back into that same read-only input path). Copying it into checkpoint_dir
-        # first means there's no mismatched directory left to infer wrong.
+    if resume_from_checkpoint:
+        # Two independent reasons a resumed checkpoint's ORIGINAL location
+        # can't be trusted as writable, regardless of what directory-equality
+        # checks say (a prior version of this code tried to detect the
+        # mismatch instead of just always avoiding it, and that detection
+        # silently failed to trigger on a real Kaggle run for reasons that
+        # weren't worth chasing further):
+        #   1. It may not even be in checkpoint_dir (e.g. a Kaggle input
+        #      Dataset, read-only).
+        #   2. Lightning's ModelCheckpoint saves each callback's OWN internal
+        #      state (best_model_path/dirpath/etc.) INSIDE the checkpoint
+        #      file -- confirmed directly by inspecting one. If any past run
+        #      ever pointed best_surface_ckpt's dirpath somewhere that's
+        #      since unwritable, that stale path is embedded in the file
+        #      itself and gets restored into the live callback on resume,
+        #      independent of where the file currently lives.
+        # So: unconditionally copy (if needed) into checkpoint_dir AND strip
+        # embedded callback state, every time, rather than trying to detect
+        # which of these needs doing. Costs only each ModelCheckpoint's
+        # "best score so far" bookkeeping, never the model/optimizer/epoch
+        # state actually needed to resume correctly.
         local_resume_path = os.path.join(
             checkpoint_dir, os.path.basename(resume_from_checkpoint)
         )
-        shutil.copy2(resume_from_checkpoint, local_resume_path)
+        if os.path.abspath(resume_from_checkpoint) != os.path.abspath(local_resume_path):
+            shutil.copy2(resume_from_checkpoint, local_resume_path)
         resume_from_checkpoint = local_resume_path
 
-    if resume_from_checkpoint:
-        # A checkpoint saves each callback's OWN internal state (e.g.
-        # ModelCheckpoint's best_model_path/kth_best_model_path), not just
-        # model/optimizer/epoch state -- if ANY past run ever pointed
-        # best_surface_ckpt's dirpath somewhere that's since become
-        # unwritable (e.g. a read-only Kaggle input Dataset -- hit this for
-        # real: resuming from a checkpoint saved after that pointed
-        # best_surface_ckpt back at the read-only mount, even though THIS
-        # run's dirpath is correctly under checkpoint_dir), that stale path
-        # gets restored into the live callback on resume and the next save
-        # crashes. This is a different failure mode than the directory copy
-        # above -- that only fixes the resumed FILE's own location, not
-        # state saved *inside* it. Stripping "callbacks" here costs only
-        # each ModelCheckpoint's "best score so far" bookkeeping, never the
-        # model/optimizer/epoch state actually needed to resume correctly.
         ckpt = torch.load(resume_from_checkpoint, map_location="cpu", weights_only=False)
         if ckpt.get("callbacks"):
             ckpt["callbacks"] = {}
-            torch.save(ckpt, resume_from_checkpoint)
+        torch.save(ckpt, resume_from_checkpoint)
         print(f"Resuming from {resume_from_checkpoint}")
 
     trainer = L.Trainer(
