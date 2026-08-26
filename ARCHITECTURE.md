@@ -501,3 +501,32 @@ visibility, don't act on it" is not actually inert under mixed-precision
 training if the diagnostic itself can produce extreme values — the fix
 needed to prevent the extreme value from being computed at all, not just
 prevent it from reaching the loss.
+
+**It happened a second time anyway, on the very next run.** The plain-MSE
+loss-formulation run (`wall_weight_peak=1.0`, the experiment section 10's
+correction motivated) froze the same way: `torch.load`-diffing its own
+epoch-19 and epoch-29 checkpoints showed 1800 optimizer steps producing
+zero parameter change, with epochs 29 through 51+ (everything since)
+training on nothing. `wss_proxy_weight` defaults to `0.0` and the fix
+above was already on disk by then, so the code *should* have been safe —
+the most likely explanation is a `git pull` on Kaggle without a full
+kernel restart afterward, meaning Python kept running the previously
+*imported* (pre-fix) `TrainModule` class from memory even though the file
+on disk was correct. Two real, separate ways the exact same failure mode
+happened: the bug itself, and then a process gap (pull without restart)
+that silently un-fixed the fix. Neither was caught until well after the
+fact by manually comparing checkpoints — which is itself the actual
+lesson: **relying on a person to notice was the real failure**, not just
+the specific fp16 bug.
+
+Fixed properly this time: `TrainModule.on_validation_epoch_end` now
+fingerprints all parameters (cheap — one `sum()`) every epoch and compares
+to the previous epoch's fingerprint. Two consecutive identical
+fingerprints (a real training step essentially never leaves every
+parameter bit-for-bit unchanged) prints a loud warning and sets
+`trainer.should_stop = True`, halting the run automatically instead of
+continuing to burn GPU hours on frozen weights — verified locally to
+correctly stop within 3 epochs under a simulated freeze (`lr=0`) and to
+never false-positive under normal training. This is the difference between
+a fix that removes one specific cause and a safeguard that catches the
+*symptom* regardless of cause — worth having both.
