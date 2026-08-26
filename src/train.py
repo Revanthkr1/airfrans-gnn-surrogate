@@ -169,6 +169,39 @@ class TrainModule(L.LightningModule):
         self.wall_weight_length_scale = wall_weight_length_scale
         self.wss_proxy_weight = wss_proxy_weight
         self.wss_proxy_min_cos = wss_proxy_min_cos
+        self._last_param_fingerprint = None
+        self._frozen_epochs = 0
+
+    def on_validation_epoch_end(self):
+        # Frozen-weights canary. Hit this exact failure mode twice already
+        # (fp16 overflow poisoning the AMP grad scaler into silently
+        # skipping every optimizer step -- ARCHITECTURE.md section 11) --
+        # both times it went undetected for dozens of epochs / hours of
+        # real GPU time because nothing was actually watching for it, only
+        # caught after the fact by manually diffing two checkpoints'
+        # state_dicts. This does that check automatically, every epoch,
+        # cheaply (one sum over all params). Two consecutive identical
+        # fingerprints is decisive -- a real training step essentially
+        # never leaves every single parameter bit-for-bit unchanged.
+        with torch.no_grad():
+            fingerprint = sum(p.sum().item() for p in self.parameters())
+        if self._last_param_fingerprint is not None and fingerprint == self._last_param_fingerprint:
+            self._frozen_epochs += 1
+        else:
+            self._frozen_epochs = 0
+        self._last_param_fingerprint = fingerprint
+        self.log("frozen_epochs", float(self._frozen_epochs))
+        if self._frozen_epochs >= 2:
+            print(
+                f"\n{'!' * 70}\nWEIGHTS HAVE NOT CHANGED FOR {self._frozen_epochs + 1} EPOCHS "
+                f"(param fingerprint identical). Stopping training now instead of "
+                f"wasting further GPU time -- this exact signature has meant a "
+                f"poisoned AMP grad scaler both previous times (see ARCHITECTURE.md "
+                f"section 11). The last checkpoint before this run's weights froze "
+                f"is still the one to resume from, not the most recent one.\n{'!' * 70}\n",
+                flush=True,
+            )
+            self.trainer.should_stop = True
 
     def forward(self, batch):
         return self.model(batch.x, batch.edge_index, batch.edge_attr)
