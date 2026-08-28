@@ -11,6 +11,7 @@ object without needing to reload or reset() anything.
 """
 import numpy as np
 import torch
+from scipy.stats import spearmanr
 
 from src.data import load_case, split_names
 from src.graph import build_graph
@@ -199,6 +200,24 @@ def summarize(results):
     cl_ref = np.array([r["cl_ref"] for r in results])
     summary["cd_rel_l2"] = float(np.linalg.norm(cd_pred - cd_ref) / np.linalg.norm(cd_ref))
     summary["cl_rel_l2"] = float(np.linalg.norm(cl_pred - cl_ref) / np.linalg.norm(cl_ref))
+
+    # Mean of PER-CASE relative error (not the aggregate ratio above) --
+    # matches the AirfRANS paper's own benchmark convention ("we compute the
+    # mean and standard deviation of the relative error on the drag and lift
+    # coefficients", section 5), needed for a fair comparison against their
+    # published MLP/GraphSAGE/PointNet/Graph U-Net baselines rather than
+    # comparing two differently-defined numbers. Same per-case formula as
+    # airfrans.Simulation.coefficient_relative_error().
+    summary["cd_mean_rel_err"] = float(np.mean(np.abs(cd_pred - cd_ref) / np.abs(cd_ref)))
+    summary["cl_mean_rel_err"] = float(np.mean(np.abs(cl_pred - cl_ref) / np.abs(cl_ref)))
+
+    # Spearman rank correlation -- also reported in the AirfRANS paper (rho_D,
+    # rho_L) alongside relative error specifically because relative error is
+    # so unforgiving for a cancellation-based quantity like Cd. For a design-
+    # screening use case (rank airfoil A above airfoil B), this is arguably
+    # the more honest measure of usefulness than the raw relative error above.
+    summary["cd_spearman"] = float(spearmanr(cd_pred, cd_ref).statistic)
+    summary["cl_spearman"] = float(spearmanr(cl_pred, cl_ref).statistic)
 
     # Split by contribution -- pressure drag (cdp, needs only the predicted
     # pressure field) vs. friction drag (cdv, needs the wall-normal *gradient*
