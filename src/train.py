@@ -21,7 +21,7 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.utils import scatter
 
 from src.data import split_names
-from src.dataset import CachedPyGAirfRANSDataset
+from src.dataset import CachedPyGAirfRANSDataset, CachedRadiusSubsampledDataset
 from src.metrics import mean_abs_error_per_field, relative_l2_per_field
 from src.model import MeshGraphNet
 
@@ -317,6 +317,10 @@ def main(
     wall_weight_length_scale=WALL_WEIGHT_LENGTH_SCALE,
     wss_proxy_weight=WSS_PROXY_WEIGHT,
     wss_proxy_min_cos=WSS_PROXY_MIN_COS,
+    use_radius_subsampling=False,
+    subsample_n_nodes=32000,
+    subsample_r=0.05,
+    subsample_max_neighbors=64,
 ):
     """batch_size=1 by default: batching multiple full-resolution graphs (each
     ~180k nodes/~720k edges) into one forward pass blew past a 16GB T4's memory
@@ -335,6 +339,16 @@ def main(
     resumes from that -- so just re-running after a disconnect picks up where
     training left off instead of restarting at epoch 0. Pass an explicit path
     to override, or a nonexistent dir if you genuinely want to start fresh.
+
+    use_radius_subsampling: train on CachedRadiusSubsampledDataset (random
+    n_nodes-node resample + a fresh spatial radius-graph rebuilt every
+    epoch, src/dataset.py) instead of the real fixed mesh. This is the
+    actual training regime behind the AirfRANS paper's own best baseline
+    (GraphSAGE, Cd relative error ~4%) -- see ARCHITECTURE.md section 11.
+    subsample_n_nodes/subsample_r/subsample_max_neighbors match their
+    published defaults (32000, 0.05, 64) but are exposed here since they
+    were tuned for GraphSAGE's own smaller architecture, not necessarily
+    this project's MeshGraphNet sizing.
     """
     stats = dict(np.load(stats_path))
     all_train_names = split_names(dataset_root, task="full", train=True)
@@ -342,8 +356,15 @@ def main(
     train_names = all_train_names[:-n_val]
     val_names = all_train_names[-n_val:]
 
-    train_ds = CachedPyGAirfRANSDataset(cache_dir, train_names, stats=stats)
-    val_ds = CachedPyGAirfRANSDataset(cache_dir, val_names, stats=stats)
+    if use_radius_subsampling:
+        dataset_kwargs = dict(
+            n_nodes=subsample_n_nodes, r=subsample_r, max_neighbors=subsample_max_neighbors
+        )
+        train_ds = CachedRadiusSubsampledDataset(cache_dir, train_names, stats=stats, **dataset_kwargs)
+        val_ds = CachedRadiusSubsampledDataset(cache_dir, val_names, stats=stats, **dataset_kwargs)
+    else:
+        train_ds = CachedPyGAirfRANSDataset(cache_dir, train_names, stats=stats)
+        val_ds = CachedPyGAirfRANSDataset(cache_dir, val_names, stats=stats)
 
     loader_kwargs = dict(
         num_workers=num_workers, persistent_workers=num_workers > 0, pin_memory=True

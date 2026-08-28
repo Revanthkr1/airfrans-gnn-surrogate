@@ -4,7 +4,7 @@ import torch
 from torch_geometric.data import Data, Dataset
 
 from src.data import load_case
-from src.graph import build_graph, build_subsampled_graph
+from src.graph import build_graph, build_subsampled_graph, radius_graph_edges
 from src.preprocess import cache_path
 
 
@@ -129,6 +129,81 @@ class CachedPyGAirfRANSDataset(Dataset):
         # must stay unnormalized (see AirfRANSGraphDataset.__getitem__ above).
         normal = torch.zeros(x5.size(0), 2, dtype=x5.dtype)
         normal[surface] = item["normal_at_surface"].float()
+        x = torch.cat([x5, normal], dim=1)
+
+        if self.stats is not None:
+            node_mean = torch.as_tensor(self.stats["node_mean"], dtype=torch.float32)
+            node_std = torch.as_tensor(self.stats["node_std"], dtype=torch.float32)
+            target_mean = torch.as_tensor(self.stats["target_mean"], dtype=torch.float32)
+            target_std = torch.as_tensor(self.stats["target_std"], dtype=torch.float32)
+            x = (x - node_mean) / node_std
+            targets = (targets - target_mean) / target_std
+
+        return Data(
+            x=x,
+            edge_index=edge_index,
+            edge_attr=edge_attr,
+            y=targets,
+            name=item["name"],
+            surface=surface,
+            wall_distance=wall_distance,
+            normal=normal,
+        )
+
+
+class CachedRadiusSubsampledDataset(Dataset):
+    """Same cache as CachedPyGAirfRANSDataset, but instead of the real mesh
+    connectivity, resamples n_nodes and rebuilds a radius-graph fresh on
+    every get() call -- the actual training regime behind the AirfRANS
+    paper's own best baseline (GraphSAGE, Cd relative error ~4%), not our
+    from-scratch attempt to fix Cd via loss-shape tuning. See
+    build_radius_subsampled_graph / radius_graph_edges (src/graph.py) for
+    why this differs from the mesh's own edges and why cKDTree instead of
+    torch_geometric.nn.radius_graph.
+
+    Called once per epoch per case by the DataLoader (PyG re-fetches via
+    get() every epoch), so the subsample and its graph are genuinely
+    different each epoch -- matching the paper's per-epoch resampling,
+    and providing implicit data augmentation the fixed-mesh dataset never
+    had.
+    """
+
+    def __init__(self, cache_dir, names, stats=None, n_nodes=32000, r=0.05, max_neighbors=64):
+        super().__init__()
+        self.cache_dir = cache_dir
+        self.names = names
+        self.stats = stats
+        self.n_nodes = n_nodes
+        self.r = r
+        self.max_neighbors = max_neighbors
+
+    def len(self):
+        return len(self.names)
+
+    def get(self, idx):
+        name = self.names[idx]
+        item = torch.load(cache_path(self.cache_dir, name), weights_only=True)
+        x5_full = item["node_features"].float()
+        targets_full = item["targets"].float()
+        surface_full = item["surface"].bool()
+        normal_full = torch.zeros(x5_full.size(0), 2, dtype=x5_full.dtype)
+        normal_full[surface_full] = item["normal_at_surface"].float()
+
+        n_total = x5_full.size(0)
+        sub_idx = torch.from_numpy(
+            np.random.default_rng().choice(n_total, size=min(self.n_nodes, n_total), replace=False)
+        )
+        x5 = x5_full[sub_idx]
+        targets = targets_full[sub_idx]
+        surface = surface_full[sub_idx]
+        normal = normal_full[sub_idx]
+        wall_distance = x5[:, 2:3].clone()
+
+        position = x5[:, :2].numpy()
+        edge_index_np, edge_attr_np = radius_graph_edges(position, self.r, self.max_neighbors)
+        edge_index = torch.tensor(edge_index_np, dtype=torch.long)
+        edge_attr = torch.tensor(edge_attr_np, dtype=torch.float32)
+
         x = torch.cat([x5, normal], dim=1)
 
         if self.stats is not None:
