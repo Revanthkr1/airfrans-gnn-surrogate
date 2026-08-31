@@ -322,6 +322,7 @@ def main(
     subsample_r=0.05,
     subsample_max_neighbors=64,
     gradient_clip_val=1.0,
+    detect_anomaly=False,
 ):
     """batch_size=1 by default: batching multiple full-resolution graphs (each
     ~180k nodes/~720k edges) into one forward pass blew past a 16GB T4's memory
@@ -360,6 +361,18 @@ def main(
     from the real mesh's, and a sum aggregation is sensitive to that in a
     way gradient clipping is the standard mitigation for. Passed straight
     through to Lightning's Trainer, which clips by global gradient norm.
+    Confirmed NOT sufficient on its own, though -- val_loss still went nan
+    with clipping on. Clipping only rescales gradients that are large but
+    finite; it does nothing if the loss itself is already nan/inf before
+    backward() even runs, which is what detect_anomaly is for.
+
+    detect_anomaly: wraps training in torch.autograd.set_detect_anomaly(True)
+    (PyTorch's own tool for exactly this situation), which raises immediately
+    at the FIRST forward-pass operation that produces a nan/inf, with the
+    exact stack trace -- pinpoints the real source instead of guessing
+    further. Much slower (roughly 2-3x) and not meant for real training runs,
+    only a short diagnostic one (a handful of epochs, or even just until the
+    first anomaly fires).
     """
     stats = dict(np.load(stats_path))
     all_train_names = split_names(dataset_root, task="full", train=True)
@@ -488,6 +501,7 @@ def main(
         accumulate_grad_batches=accumulate_grad_batches,
         callbacks=[periodic_ckpt, best_surface_ckpt],
         gradient_clip_val=gradient_clip_val,
+        detect_anomaly=detect_anomaly,
     )
     trainer.fit(module, train_loader, val_loader, ckpt_path=resume_from_checkpoint)
 
