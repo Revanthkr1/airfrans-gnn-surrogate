@@ -321,6 +321,7 @@ def main(
     subsample_n_nodes=32000,
     subsample_r=0.05,
     subsample_max_neighbors=64,
+    gradient_clip_val=1.0,
 ):
     """batch_size=1 by default: batching multiple full-resolution graphs (each
     ~180k nodes/~720k edges) into one forward pass blew past a 16GB T4's memory
@@ -349,6 +350,16 @@ def main(
     published defaults (32000, 0.05, 64) but are exposed here since they
     were tuned for GraphSAGE's own smaller architecture, not necessarily
     this project's MeshGraphNet sizing.
+
+    gradient_clip_val: this project had never needed gradient clipping on
+    the fixed full mesh, but the radius-subsampling regime produced a real
+    val_loss=nan by epoch 2 on a real run (precision="32-true", so not an
+    fp16 artifact -- see ARCHITECTURE.md section 11). GraphNetBlock's node
+    update aggregates incoming edges with a *sum*, not a mean
+    (src/model.py) -- a radius-graph's node degree distribution differs
+    from the real mesh's, and a sum aggregation is sensitive to that in a
+    way gradient clipping is the standard mitigation for. Passed straight
+    through to Lightning's Trainer, which clips by global gradient norm.
     """
     stats = dict(np.load(stats_path))
     all_train_names = split_names(dataset_root, task="full", train=True)
@@ -476,6 +487,7 @@ def main(
         logger=False,
         accumulate_grad_batches=accumulate_grad_batches,
         callbacks=[periodic_ckpt, best_surface_ckpt],
+        gradient_clip_val=gradient_clip_val,
     )
     trainer.fit(module, train_loader, val_loader, ckpt_path=resume_from_checkpoint)
 
