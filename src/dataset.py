@@ -4,7 +4,7 @@ import torch
 from torch_geometric.data import Data, Dataset
 
 from src.data import load_case
-from src.graph import build_graph, build_subsampled_graph, radius_graph_edges
+from src.graph import airfoil_polyline, build_graph, build_subsampled_graph, radius_graph_edges
 from src.preprocess import cache_path
 
 
@@ -113,6 +113,11 @@ class CachedPyGAirfRANSDataset(Dataset):
         # changed, not the training math.
         x5 = item["node_features"].float()
         targets = item["targets"].float()
+        # Some cases cached before src/preprocess.py clamped raw targets can
+        # still have literal inf baked in (float16 overflow at cache time --
+        # see preprocess_case) -- nan_to_num here fixes those already-built
+        # caches without needing a full re-preprocess.
+        targets = torch.nan_to_num(targets, nan=0.0, posinf=6.0e4, neginf=-6.0e4)
         edge_index = item["edge_index"].long()  # PyG requires int64 edge_index
         surface = item["surface"].bool()
 
@@ -185,6 +190,11 @@ class CachedRadiusSubsampledDataset(Dataset):
         item = torch.load(cache_path(self.cache_dir, name), weights_only=True)
         x5_full = item["node_features"].float()
         targets_full = item["targets"].float()
+        # See CachedPyGAirfRANSDataset.get() -- fixes caches built before
+        # preprocess_case clamped raw targets, where float16 overflow left
+        # literal inf baked in for a couple of cases (stagnation-point
+        # pressure spikes ~80k-97k, past float16's ~65504 max).
+        targets_full = torch.nan_to_num(targets_full, nan=0.0, posinf=6.0e4, neginf=-6.0e4)
         surface_full = item["surface"].bool()
         normal_full = torch.zeros(x5_full.size(0), 2, dtype=x5_full.dtype)
         normal_full[surface_full] = item["normal_at_surface"].float()
@@ -200,9 +210,27 @@ class CachedRadiusSubsampledDataset(Dataset):
         wall_distance = x5[:, 2:3].clone()
 
         position = x5[:, :2].numpy()
-        edge_index_np, edge_attr_np = radius_graph_edges(position, self.r, self.max_neighbors)
+        # Full-resolution surface points (not the subsample) -- see
+        # airfoil_polyline's docstring for why the trailing edge needs full
+        # resolution to represent correctly.
+        poly = airfoil_polyline(x5_full[surface_full, :2].numpy())
+        edge_index_np, edge_attr_np = radius_graph_edges(
+            position, self.r, self.max_neighbors,
+            wall_distance=wall_distance[:, 0].numpy(), surface_polyline=poly,
+        )
         edge_index = torch.tensor(edge_index_np, dtype=torch.long)
-        edge_attr = torch.tensor(edge_attr_np, dtype=torch.float32)
+        # Real mesh edges (build_graph) are chord-fraction-scale (~1e-4 to
+        # 1e-2), the edge encoder's weight init implicitly assumes inputs in
+        # that range. A radius-graph edge can be as long as `r` itself --
+        # up to ~500x larger -- so leaving edge_attr in raw units feeds the
+        # encoder values far outside what its init was ever calibrated for.
+        # Dividing by r bounds every component to roughly [-1, 1], the same
+        # scale the model has always seen. Confirmed via detect_anomaly=True
+        # that raw edge_attr produced a NaN in the decoder's Addmm backward
+        # on the very first training step (fresh weights, before any update
+        # -- ruling out a training-dynamics divergence and pointing at input
+        # scale instead).
+        edge_attr = torch.tensor(edge_attr_np, dtype=torch.float32) / self.r
 
         x = torch.cat([x5, normal], dim=1)
 

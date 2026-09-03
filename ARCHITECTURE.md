@@ -530,3 +530,190 @@ correctly stop within 3 epochs under a simulated freeze (`lr=0`) and to
 never false-positive under normal training. This is the difference between
 a fix that removes one specific cause and a safeguard that catches the
 *symptom* regardless of cause — worth having both.
+
+**Different bug, same regime: a genuine NaN, not a frozen scaler.** Moving
+to the radius-subsampling regime (resample `n_nodes` per epoch, rebuild
+edges via `radius_graph_edges`, `src/graph.py`) reproduced the freeze under
+`precision="16-mixed"`, but running under `precision="32-true"` instead
+showed `val_loss: nan` outright by epoch 2 — proof this was a real
+divergence, not fp16 masking a stalled scaler again. `gradient_clip_val=1.0`
+did not fix it (clipping only bounds already-finite gradients; it can't
+recover a loss that's already `nan`), and a 79-epoch run under clipping
+alone silently continued on all-NaN weights the entire time
+(`val_surface_mae_mean` stuck at `inf` for the full run) — proof that
+letting training "keep going" after a NaN is pure wasted compute, not
+resilience.
+
+`Trainer(detect_anomaly=True)` pinpointed it: `AddmmBackward0 returned nan
+values`, forward trace pointing at `self.decoder(x)` (`src/model.py:59`) —
+the decoder's own `Linear` layer, deliberately the one place in the network
+without LayerNorm (section 6). This fired on the very first training step,
+fresh random init, before any optimizer update — ruling out a
+training-dynamics divergence that builds up over epochs, and pointing at
+input scale instead. `radius_graph_edges` builds `edge_attr` as raw
+`position[dst] - position[src]`, never normalized, on the reasoning (true
+for `build_graph`'s real mesh edges) that these are chord-fraction-scale
+distances a freshly-initialized network's weights are implicitly suited
+to. A radius-graph edge can be as long as `r` itself — up to ~500x larger
+than a typical mesh edge — so the encoder was seeing inputs far outside
+that implicit range. Fixed by dividing `edge_attr` by `r` in both
+`CachedRadiusSubsampledDataset.get()` and `build_radius_subsampled_graph`,
+bounding every component to roughly `[-1, 1]`, the same scale the model
+has always been fed. A small local smoke test (`detect_anomaly=True`, tiny
+model, 500 nodes) ran clean after the fix, but the real 32k-node Kaggle
+run still hit the identical `AddmmBackward0` NaN — same op, same
+`self.decoder(x)` location, but 87 batches into epoch 0 rather than on
+the very first step. That timing difference was the tell: a real
+input-scale problem would misfire immediately on fresh weights every
+time, not "sometimes, a few dozen batches in." A per-node in-degree check
+on the real cached mesh (`radius_graph_edges`, n_nodes=32000, r=0.05)
+ruled out an unbounded-aggregation hypothesis too — max in-degree 22 vs.
+mean 8.5, nowhere near enough imbalance to explain it.
+
+The actual cause was on the *target* side, not the input side. Every
+cached case stores `targets` (velocity, pressure, `nu_t`) as **float16**
+(`src/preprocess.py`, `preprocess_case`) to keep the on-disk cache small
+enough for Kaggle's disk quota (see that function's docstring — this
+already burned a quota near-miss once at 750/800 cases). float16's max
+representable value is ~65504. Scanning every case in the actual 800-case
+training split (`split_names(task="full", train=True)`, raw arrays, not
+the cache) turned up two cases with raw pressure magnitudes of ~81,120
+and ~97,490 — almost certainly a stagnation-point singularity at the
+leading edge — both silently overflowing to literal `inf` at the float16
+cast, baked into the cache from the moment it was built. Whenever the
+epoch shuffle happened to draw one of those two cases, the target became
+`inf`, the loss became `inf`, and its gradient is `nan` by definition —
+landing exactly where `detect_anomaly` reported it (the decoder is simply
+the last op backward passes through before the loss), at a batch index
+that depends purely on shuffle order, matching every inconsistent
+"epoch 2," "epoch 16," "batch 87" observation across this entire
+debugging arc. It explains why gradient clipping never helped (clipping
+rescales already-finite gradients; it can't repair a loss that's already
+`nan`), and why this wasn't specific to the radius-subsampling regime at
+all — `CachedPyGAirfRANSDataset` (the original full-mesh path) reads the
+exact same float16 cache and was always equally exposed; it most likely
+just hadn't drawn one of the two bad cases before some other issue (the
+wss-proxy freeze, primarily) intervened first.
+
+Beyond those two outright-`inf` cases, the same scan found a long tail of
+cases with normalized target outliers of 20–37 standard deviations
+(mostly `nu_t` and pressure), finite but severe — consistent with RANS
+`nu_t` and near-wall pressure both being heavy-tailed fields with rare
+extreme nodes, not cache corruption.
+
+Fixed in two layers, since the corruption already exists in whatever
+cache is sitting on Kaggle right now and a full re-preprocess is
+expensive: `preprocess_case` now clips raw targets to ±6e4 (safely inside
+float16's range) before the cast, so no *future* preprocessing run can
+reintroduce this; and both `CachedPyGAirfRANSDataset.get()` and
+`CachedRadiusSubsampledDataset.get()` now run `torch.nan_to_num` on the
+loaded targets (`posinf`/`neginf` → ±6e4), which repairs the *existing*
+cache's already-baked-in `inf` values at load time without needing to
+touch the cache files themselves. Verified the `nan_to_num` call actually
+neutralizes injected `inf`/`nan` values, and reran the local
+radius-subsampling smoke test with both fixes in place — clean, finite
+`val_loss`.
+
+**With target clamping confirmed active (pull + full kernel restart), the
+exact same `AddmmBackward0` NaN recurred anyway** — same op, same
+`self.decoder(x)` location, now at batch 386/720 rather than 87. Since
+that rules out both the input-scale explanation (section already above)
+and the target-overflow explanation (this run had the fix, so the two
+known `inf`-producing cases could no longer poison anything), there had to
+be a third mechanism. Checked whether `radius_graph_edges`'s pure
+Euclidean radius search connects points across the airfoil's solid body —
+it has no notion of the airfoil as an obstacle, so near thin geometry
+(the trailing edge especially) it can pick a point on the opposite surface
+as a "nearest neighbor" purely because it's close in `(x, y)`, despite
+being physically unreachable without going around the body. Confirmed on
+real cached cases: edges as short as ~1e-6 in raw position (two mesh nodes
+that are effectively coincident, one from the upper-surface mesh line and
+one from the lower, meeting at the trailing edge) carrying a non-trivial
+target gap (0.15–1.0 in normalized target space) — the genuine
+build_graph() mesh can never produce this, since real triangulation edges
+never cross the solid.
+
+Fixed by rejecting candidate radius-graph edges whose straight-line
+segment crosses the airfoil surface polyline
+(`airfoil_polyline`/`_segments_cross_polyline`/`radius_graph_edges` in
+`src/graph.py`), wired into both `CachedRadiusSubsampledDataset.get()` and
+`build_radius_subsampled_graph`. The naive version (test every near-wall
+candidate edge against every polyline segment) blew up memory on a real
+case — 175k candidates × ~1000 polyline segments doesn't fit; fixed by
+building a second cKDTree over polyline-segment midpoints and only testing
+each candidate against its k=16 nearest segments (checked against k=64 on
+real cases first — identical edges flagged, so no correctness lost).
+Verified against the two real cases that first exposed this: ~2,500–2,900
+crossing edges removed out of ~270k (~1%), while the shortest legitimate
+(non-crossing) edges are untouched.
+
+Cost, measured honestly: this adds roughly 0.3–0.5s per case at real
+scale (32k nodes, `r=0.05`, `max_neighbors=8`) against a baseline around
+0.55s/case observed on Kaggle — a real, non-trivial slowdown, not free.
+Whether this crossing-edge bug is actually *the* remaining NaN source, or
+a real-but-separate accuracy issue, is still unconfirmed — the observed
+target gaps at crossing edges (0.15–1.0 normalized) aren't obviously large
+enough on their own to explain a hard NaN the way the float16 overflow
+was. Confirmed with kernel restart genuinely fresh (ruled out stale code):
+**with target clamping and crossing-edge rejection both active, the exact
+same `AddmmBackward0` NaN recurred a third time**, now at batch 267/720.
+Three separate, verified data bugs fixed, same failure, same location —
+strong evidence this was never purely a data-hygiene problem.
+
+Brute-force local reproduction (looping real training steps at real
+32k-node scale to catch the NaN directly, instead of round-tripping
+through Kaggle each time) turned out to be impractical on CPU:
+`CachedRadiusSubsampledDataset.get()` alone measured a consistent ~2s/case
+(all 73 locally-cached cases uniform, no outlier — ruling out a stuck
+case), meaning the model's own forward/backward at this scale dominates
+and reaching even a few hundred steps would take 20–40+ minutes locally.
+(A first attempt also stalled badly trying to preprocess more cases
+on-demand — `data/Dataset` lives under OneDrive, and reading many raw VTU
+files through it burned 26 minutes of wall clock for 71s of actual CPU
+time. Not a code bug, just a reminder that this project's data directory
+being inside a synced folder has a real cost for any bulk raw-file
+access.)
+
+Rather than keep hunting for a fourth exotic per-case cause, instrumented
+the *mechanism* directly: probed `x` (final node latent, right before
+`self.decoder(x)`) over 15 real training steps at full scale. It grows
+steadily and without leveling off — abs_max 8.36 → 9.37 → 11.69 → 12.54 →
+... → 14.32 — not noise, a real drift. Each round's residual add
+(`x = x + NodeMLP(...)`, `GraphNetBlock.forward`) is individually
+LayerNorm-bounded, but nothing bounds their *sum* across
+`n_message_passing=8` rounds, and the decoder is deliberately the one
+place in the network without LayerNorm (section 6). Extrapolating this
+drift over the 87–386 steps every Kaggle attempt survived before failing
+is entirely consistent with it eventually reaching decoder-breaking
+magnitude — a mechanism no amount of upstream data hygiene could rule
+out, since it doesn't depend on any specific bad case at all.
+
+Fixed by adding `self.pre_decoder_norm = nn.LayerNorm(latent_dim)` in
+`MeshGraphNet.__init__` (`src/model.py`) and calling
+`self.decoder(self.pre_decoder_norm(x))`. This normalizes the *scale*
+reaching the decoder, not its *output* — the decoder's own weights and
+biases can still map a normalized input to whatever unconstrained output
+range the targets need, so this doesn't reintroduce the problem section 6
+was written to avoid. Verified directly: with the norm in place, the same
+15-step probe shows `x` after normalization pinned at std≈1.00–1.002 and
+abs_max≈2.7–3.0 for the entire run, completely flat despite the
+pre-normalization value still climbing underneath it. Re-ran the small
+local smoke test (`detect_anomaly=True`) — clean.
+
+**Real consequence, flagged rather than silently patched**: this adds a
+new parameter (`pre_decoder_norm.weight`/`.bias`) to `MeshGraphNet`'s
+state dict. Any checkpoint saved *before* this change (the full-mesh
+baselines included — e.g. the epoch-47/epoch-91 checkpoints referenced
+earlier) will fail `load_state_dict` with a missing-keys error under
+Lightning's default `strict=True` loading (`TrainModule.load_from_checkpoint`,
+`src/evaluate.py`). No existing evaluation code was changed to
+paper over this — old checkpoints are now architecturally incompatible
+with the current `MeshGraphNet`, and loading them needs an explicit
+`strict=False` (accepting that `pre_decoder_norm` starts at its default
+init, not a trained value) if they're ever needed again.
+
+Next real test: rerun `detect_anomaly=True` on Kaggle for close to a full
+epoch with all four fixes in place (edge_attr/r scaling, target clamping,
+crossing-edge rejection, pre-decoder LayerNorm) and watch both whether it
+finally stays clean and how much the crossing-edge check costs at full
+32k-node GPU scale.

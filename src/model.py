@@ -49,6 +49,25 @@ class MeshGraphNet(nn.Module):
         self.blocks = nn.ModuleList(
             [GraphNetBlock(latent_dim, hidden_dim) for _ in range(n_message_passing)]
         )
+        # Normalizes the SCALE of x reaching the decoder, not its output --
+        # the decoder's own weights/biases can still freely map a normalized
+        # input to an unconstrained output range, so this doesn't fight the
+        # decoder's own lack of LayerNorm (section 6: forcing the *output*
+        # to zero-mean-unit-variance would fight learning the real target
+        # distribution -- normalizing the *input* doesn't do that). Added
+        # after repeated detect_anomaly=True runs on the radius-subsampling
+        # regime all pinpointed the same NaN at this exact op
+        # (self.decoder's first Addmm) despite fixing three separate,
+        # verified, unrelated data bugs (edge_attr scale, float16 target
+        # overflow, cross-body radius-graph edges) -- none of which fully
+        # resolved it. Each residual add across n_message_passing rounds is
+        # itself LayerNorm-bounded, but their SUM into x is not, and a local
+        # probe (ARCHITECTURE.md section 11) showed x's scale genuinely
+        # drifting upward over real training steps rather than staying
+        # fixed -- consistent with "eventually some batch pushes it past
+        # the decoder's unprotected Linear layers," which no amount of
+        # upstream data hygiene alone can rule out.
+        self.pre_decoder_norm = nn.LayerNorm(latent_dim)
         self.decoder = mlp(latent_dim, hidden_dim, out_dim, layernorm=False)
 
     def forward(self, node_features, edge_index, edge_attr):
@@ -56,4 +75,4 @@ class MeshGraphNet(nn.Module):
         e = self.edge_encoder(edge_attr)
         for block in self.blocks:
             x, e = block(x, edge_index, e)
-        return self.decoder(x)
+        return self.decoder(self.pre_decoder_norm(x))

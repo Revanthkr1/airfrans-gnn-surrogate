@@ -48,6 +48,16 @@ def preprocess_case(dataset_root, name, cache_dir, delete_raw_after=False):
         targets = np.concatenate(
             [simulation.velocity, simulation.pressure, simulation.nu_t], axis=1
         )
+        # Two cases in the full-800 split have a raw pressure magnitude (~81k,
+        # ~97k, at what's almost certainly the stagnation point) that overflows
+        # float16's max (~65504) -- silently becoming `inf` at the cast below,
+        # baked into the cache forever, and eventually producing a genuine NaN
+        # loss/gradient whenever training happens to draw that case (confirmed
+        # via torch.autograd.set_detect_anomaly -- see ARCHITECTURE.md section
+        # 11). Clamped with margin so no future preprocessing run reintroduces
+        # this; CachedPyGAirfRANSDataset/CachedRadiusSubsampledDataset.get()
+        # also nan_to_num on load to fix caches already built before this fix.
+        targets = np.clip(targets, -6.0e4, 6.0e4)
         # float16 on disk, not float32: halves node_features/targets/normal's
         # footprint. Cast back to float32 immediately on load
         # (CachedPyGAirfRANSDataset.get()) so training math is unaffected --
